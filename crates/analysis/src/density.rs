@@ -38,8 +38,8 @@ impl KernelType {
 /// Upper limit on total output raster cells to prevent memory exhaustion (64 MB for f32).
 pub const MAX_DENSITY_CELLS: usize = 16_000_000;
 
-/// Upper limit on aggregate cell visits across all points to prevent CPU exhaustion.
-pub const MAX_DENSITY_WORK: usize = 50_000_000;
+/// Upper limit on aggregate cell visits across all points to prevent CPU exhaustion (matching MAX_IDW_WORK).
+pub const MAX_DENSITY_WORK: usize = 400_000_000;
 
 /// Default target grid resolution along the longer side of the extent when pixel size is not specified.
 const DEFAULT_GRID_STEPS: f64 = 250.0;

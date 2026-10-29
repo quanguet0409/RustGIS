@@ -2457,7 +2457,12 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
         None if given("pixelSize") => return Err("pixel size must be a number".into()),
         None => {
             let auto = crate::density::auto_cell_size(&grid_ext);
-            if user_radius { auto.min(bandwidth) } else { auto }
+            if user_radius && auto > bandwidth {
+                return Err(
+                    "search radius must be at least the pixel size; choose a larger search radius or specify a smaller pixelSize".into()
+                );
+            }
+            auto
         }
     };
 
@@ -5243,6 +5248,14 @@ mod tests {
         // 19. pixelSize larger than automatic Silverman radius raises radius to pixelSize instead of erroring
         let res_auto_bump = crate::run("kernelDensity", &m_outlier, &serde_json::json!({"input": "outlier_ds", "pixelSize": 1000.0}));
         assert!(res_auto_bump.is_ok(), "pixelSize > auto radius should succeed by bumping radius: {:?}", res_auto_bump.err());
+
+        // 20. User sets radius smaller than default 250-step cell size with pixelSize omitted returns clear error
+        let err_small_radius =
+            crate::run("kernelDensity", &m_outlier, &serde_json::json!({"input": "outlier_ds", "radius": 10.0})).unwrap_err();
+        assert!(
+            err_small_radius.contains("search radius must be at least the pixel size"),
+            "expected clear error on small radius with omitted pixelSize, got: {err_small_radius}"
+        );
     }
 
     #[test]
