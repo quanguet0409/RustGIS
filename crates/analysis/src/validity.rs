@@ -352,7 +352,35 @@ fn validate_line(parts: &[Vec<Coord>], feature_id: u64) -> ValidationRecord {
             };
         }
 
-        match check_self_crossing(part, false) {
+        // Check for vertex self-touches, spikes, and self-loops (passing through same point more than once)
+        // Checking on distinct vertices with consecutive duplicates already collapsed:
+        let mut seen: HashMap<(u64, u64), usize> = HashMap::with_capacity(distinct.len());
+        for (idx, c) in distinct.iter().enumerate() {
+            let norm_x = if c.x == 0.0 { 0.0 } else { c.x };
+            let norm_y = if c.y == 0.0 { 0.0 } else { c.y };
+            let key = (norm_x.to_bits(), norm_y.to_bits());
+            if let Some(&first_idx) = seen.get(&key) {
+                if first_idx == 0 && idx == distinct.len() - 1 && distinct.len() >= 4 {
+                    // Permitted simple closed loop closure (at least 3 distinct edges, e.g. A -> B -> C -> A)
+                    continue;
+                }
+                return ValidationRecord {
+                    feature_id,
+                    geometry_type: "Polyline",
+                    status: ValidityStatus::Invalid,
+                    valid: false,
+                    error_category: ValidityCategory::SelfIntersection,
+                    error_reason: format!(
+                        "Polyline part {part_idx} passes through vertex ({:.6}, {:.6}) multiple times (non-simple)",
+                        c.x, c.y
+                    ),
+                    error_location: Some(*c),
+                };
+            }
+            seen.insert(key, idx);
+        }
+
+        match check_self_crossing(&distinct, false) {
             CrossingCheck::Crossing(cross_loc) => {
                 return ValidationRecord {
                     feature_id,
@@ -525,15 +553,9 @@ fn interpret_geo_multipolygon_error(
             let p_idx = orig_indices.get(geom_idx.0).copied().unwrap_or(geom_idx.0);
             match poly_err {
                 InvalidPolygon::SelfIntersection(role) => {
-                    let role_str = match role {
-                        RingRole::Exterior => "exterior ring",
-                        RingRole::Interior(_) => "interior ring (hole)",
-                    };
+                    let role_str = ring_role_label(role);
                     let loc = polys.get(p_idx).and_then(|rings| {
-                        let r_idx = match role {
-                            RingRole::Exterior => 0,
-                            RingRole::Interior(i) => i + 1,
-                        };
+                        let r_idx = ring_role_index(role);
                         rings.get(r_idx).and_then(|r| match check_self_crossing(r, true) {
                             CrossingCheck::Crossing(c) => Some(c),
                             _ => r.first().copied(),
@@ -550,15 +572,9 @@ fn interpret_geo_multipolygon_error(
                     }
                 }
                 InvalidPolygon::TooFewPointsInRing(role) => {
-                    let role_str = match role {
-                        RingRole::Exterior => "exterior ring",
-                        RingRole::Interior(_) => "interior ring (hole)",
-                    };
+                    let role_str = ring_role_label(role);
                     let loc = polys.get(p_idx).and_then(|rings| {
-                        let r_idx = match role {
-                            RingRole::Exterior => 0,
-                            RingRole::Interior(i) => i + 1,
-                        };
+                        let r_idx = ring_role_index(role);
                         rings.get(r_idx).and_then(|r| r.first().copied())
                     });
                     ValidationRecord {
@@ -956,6 +972,7 @@ pub fn check_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     let mut invalid_count = 0usize;
     let mut empty_count = 0usize;
     let mut null_count = 0usize;
+    let mut error_count = 0usize;
     let mut category_counts: HashMap<ValidityCategory, usize> = HashMap::new();
 
     crate::control::begin(total);
@@ -976,8 +993,8 @@ pub fn check_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
             }
             ValidityStatus::Empty => empty_count += 1,
             ValidityStatus::Null => null_count += 1,
-            ValidityStatus::Unsupported | ValidityStatus::Error => {
-                invalid_count += 1;
+            ValidityStatus::Error | ValidityStatus::Unsupported => {
+                error_count += 1;
                 *category_counts.entry(record.error_category).or_insert(0) += 1;
             }
         }
@@ -1000,8 +1017,9 @@ pub fn check_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     }
 
     let mut messages = Vec::new();
+    let err_suffix = if error_count > 0 { format!(", {error_count} error") } else { String::new() };
     messages.push(format!(
-        "Check Geometry complete: {total} feature(s) checked ({valid_count} valid, {invalid_count} invalid, {empty_count} empty, {null_count} null)."
+        "Check Geometry complete: {total} feature(s) checked ({valid_count} valid, {invalid_count} invalid, {empty_count} empty, {null_count} null{err_suffix})."
     ));
 
     if invalid_count > 0 {
@@ -1106,7 +1124,9 @@ pub fn fix_geometries(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     ));
 
     if failed_count > 0 {
-        messages.push(format!("Failed repairs (original geometries preserved): {}", failed_details.join("; ")));
+        let extra =
+            if failed_count > failed_details.len() { format!("; and {} more", failed_count - failed_details.len()) } else { String::new() };
+        messages.push(format!("Failed repairs (original geometries preserved): {}{}", failed_details.join("; "), extra));
     }
 
     if total_dropped_non_finite > 0 {
@@ -1384,6 +1404,34 @@ mod tests {
         let fix = fix_geometry(&line);
         // Fast path keeps 100% bitwise coordinates intact as Unchanged
         assert_eq!(fix, FixOutcome::Unchanged(line));
+    }
+
+    #[test]
+    fn test_polyline_spike_and_loop_self_intersection() {
+        // Spike [A, B, A] doubles back on itself
+        let spike = Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(5.0, 5.0), Coord::new(0.0, 0.0)]]);
+        let rec_spike = validate_geometry(Some(&spike), 1, GeometryType::Polyline);
+        assert_eq!(rec_spike.status, ValidityStatus::Invalid);
+        assert_eq!(rec_spike.error_category, ValidityCategory::SelfIntersection);
+
+        // Self-touching loop [A, B, C, B, D] passes through B twice
+        let loop_line = Geometry::Line(vec![vec![
+            Coord::new(0.0, 0.0),
+            Coord::new(2.0, 2.0),
+            Coord::new(3.0, 1.0),
+            Coord::new(2.0, 2.0),
+            Coord::new(5.0, 5.0),
+        ]]);
+        let rec_loop = validate_geometry(Some(&loop_line), 2, GeometryType::Polyline);
+        assert_eq!(rec_loop.status, ValidityStatus::Invalid);
+        assert_eq!(rec_loop.error_category, ValidityCategory::SelfIntersection);
+        assert_eq!(rec_loop.error_location, Some(Coord::new(2.0, 2.0)));
+
+        // Permitted closed loop [A, B, C, A]
+        let closed_loop =
+            Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(5.0, 0.0), Coord::new(5.0, 5.0), Coord::new(0.0, 0.0)]]);
+        let rec_closed = validate_geometry(Some(&closed_loop), 3, GeometryType::Polyline);
+        assert_eq!(rec_closed.status, ValidityStatus::Valid);
     }
 
     #[test]
