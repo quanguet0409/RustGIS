@@ -210,3 +210,92 @@ fn test_unrepairable_geometry_preserves_feature() {
     assert_eq!(out.features[0].attrs, vec![Value::Text("bad_pt".into()), Value::Int(999)]);
     assert!(res.messages[0].contains("1 failed"));
 }
+
+#[test]
+fn test_lossy_notices_and_clean_notices() {
+    // 1. Clean dataset: must produce NO lossy notices
+    let mut clean_layer = create_layer("clean", GeometryType::Polygon);
+    let clean_square = Geometry::Polygon(vec![vec![vec![
+        Coord::new(0.0, 0.0),
+        Coord::new(10.0, 0.0),
+        Coord::new(10.0, 10.0),
+        Coord::new(0.0, 10.0),
+        Coord::new(0.0, 0.0),
+    ]]]);
+    clean_layer.ds.push_next(Some(clean_square), vec![Value::Text("clean".into()), Value::Int(1)]);
+
+    let clean_res = rustgis_analysis::run("fixGeometries", &clean_layer, &json!({"input": "clean"}))
+        .expect("fixGeometries on clean input should succeed");
+    assert_eq!(clean_res.messages.len(), 1, "clean input should only have summary message");
+    assert!(!clean_res.messages[0].contains("dropped"));
+
+    // 2. Lossy dataset: polygon with a NaN coordinate and a degenerate hole, plus a multipart line with a collapsed part
+    let mut lossy_poly_layer = create_layer("lossy_poly", GeometryType::Polygon);
+    let lossy_poly = Geometry::Polygon(vec![vec![
+        // Exterior ring with a NaN coordinate (repairable polygon: 4 valid coords + 1 NaN)
+        vec![
+            Coord::new(0.0, 0.0),
+            Coord::new(10.0, 0.0),
+            Coord::new(f64::NAN, 5.0),
+            Coord::new(10.0, 10.0),
+            Coord::new(0.0, 10.0),
+            Coord::new(0.0, 0.0),
+        ],
+        // Degenerate hole (fewer than 3 distinct points)
+        vec![Coord::new(5.0, 5.0), Coord::new(5.0, 5.0), Coord::new(5.0, 5.0), Coord::new(5.0, 5.0)],
+    ]]);
+    lossy_poly_layer.ds.push_next(Some(lossy_poly), vec![Value::Text("lossy_poly".into()), Value::Int(2)]);
+
+    let poly_res = rustgis_analysis::run("fixGeometries", &lossy_poly_layer, &json!({"input": "lossy_poly"}))
+        .expect("fixGeometries on lossy polygon should succeed");
+    let all_poly_msgs = poly_res.messages.join("\n");
+    assert!(all_poly_msgs.contains("1 non-finite coordinate(s) dropped across 1 feature(s)."));
+    assert!(all_poly_msgs.contains("1 degenerate interior ring(s) (holes) dropped across 1 feature(s)."));
+
+    // 3. Lossy line layer: multi-part line with one valid part and one collapsed part
+    let mut lossy_line_layer = create_layer("lossy_line", GeometryType::Polyline);
+    let lossy_line =
+        Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(10.0, 10.0)], vec![Coord::new(5.0, 5.0), Coord::new(5.0, 5.0)]]);
+    lossy_line_layer.ds.push_next(Some(lossy_line), vec![Value::Text("lossy_line".into()), Value::Int(3)]);
+
+    let line_res = rustgis_analysis::run("fixGeometries", &lossy_line_layer, &json!({"input": "lossy_line"}))
+        .expect("fixGeometries on lossy line should succeed");
+    let all_line_msgs = line_res.messages.join("\n");
+    assert!(all_line_msgs.contains("1 degenerate line part(s) (fewer than 2 points) dropped across 1 feature(s)."));
+}
+
+#[test]
+fn test_exterior_ring_collapse_fails_in_fix_geometries() {
+    let mut l = create_layer("collapsed_exterior", GeometryType::Polygon);
+    let poly = Geometry::Polygon(vec![vec![
+        vec![Coord::new(0.0, 0.0), Coord::new(0.0, 0.0), Coord::new(0.0, 0.0), Coord::new(0.0, 0.0)],
+        vec![Coord::new(2.0, 2.0), Coord::new(8.0, 2.0), Coord::new(8.0, 8.0), Coord::new(2.0, 8.0), Coord::new(2.0, 2.0)],
+    ]]);
+    l.ds.push_next(Some(poly), vec![Value::Text("collapsed".into()), Value::Int(10)]);
+
+    let res = rustgis_analysis::run("fixGeometries", &l, &json!({"input": "collapsed_exterior"})).unwrap();
+    assert!(res.messages[0].contains("1 failed"));
+    let Output::Layer(out) = res.output else { panic!("expected Output::Layer") };
+    // Original geometry preserved, hole was NOT promoted to exterior!
+    let Some(Geometry::Polygon(parts)) = &out.features[0].geometry else { panic!("expected polygon") };
+    assert_eq!(parts[0][0][0], Coord::new(0.0, 0.0));
+}
+
+#[test]
+fn test_polyline_self_intersection_check_and_fix() {
+    let mut l = create_layer("crossing_line", GeometryType::Polyline);
+    let line = Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(2.0, 2.0), Coord::new(0.0, 2.0), Coord::new(2.0, 0.0)]]);
+    l.ds.push_next(Some(line.clone()), vec![Value::Text("cross".into()), Value::Int(1)]);
+
+    // Check Geometry detects self-intersection
+    let check_res = rustgis_analysis::run("checkGeometry", &l, &json!({"input": "crossing_line"})).unwrap();
+    let Output::Table(table) = check_res.output else { panic!("expected table") };
+    assert_eq!(table.features[0].attrs[2], Value::Text("Invalid".into()));
+    assert_eq!(table.features[0].attrs[4], Value::Text("Self-Intersection".into()));
+
+    // Fix Geometries fails repair and preserves original geometry
+    let fix_res = rustgis_analysis::run("fixGeometries", &l, &json!({"input": "crossing_line"})).unwrap();
+    assert!(fix_res.messages[0].contains("1 failed"));
+    let Output::Layer(out) = fix_res.output else { panic!("expected layer") };
+    assert_eq!(out.features[0].geometry, Some(line));
+}

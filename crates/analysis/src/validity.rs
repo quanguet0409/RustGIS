@@ -16,7 +16,7 @@ use geo::{Area, MakeValid, Validation};
 use rustgis_data::{Coord, Dataset, Field, FieldType, Geometry, GeometryType, Value};
 use serde_json::Value as Json;
 
-use crate::topology::self_crossing;
+use crate::topology::{CrossingCheck, check_self_crossing, segments_cross};
 use crate::{Inputs, Output, ToolResult};
 
 /// Status of a feature's geometry validation.
@@ -91,6 +91,15 @@ pub struct ValidationRecord {
     pub error_location: Option<Coord>,
 }
 
+/// Detailed counts of dropped or degenerate elements during geometry repair.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FixStats {
+    pub dropped_non_finite: usize,
+    pub dropped_parts: usize,
+    pub dropped_holes: usize,
+    pub dropped_components: usize,
+}
+
 /// The outcome of attempting to repair a geometry.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FixOutcome {
@@ -112,15 +121,48 @@ fn from_geo_coord(c: geo::Coord<f64>) -> Coord {
     Coord { x: c.x, y: c.y }
 }
 
+fn ring_role_label(role: RingRole) -> String {
+    match role {
+        RingRole::Exterior => "exterior ring".to_string(),
+        RingRole::Interior(idx) => format!("interior ring {idx}"),
+    }
+}
+
+fn ring_role_index(role: RingRole) -> usize {
+    match role {
+        RingRole::Exterior => 0,
+        RingRole::Interior(idx) => idx + 1,
+    }
+}
+
+fn find_rings_intersection(ring1: &[Coord], ring2: &[Coord]) -> Option<Coord> {
+    let segs1: Vec<(Coord, Coord)> = ring1.windows(2).filter_map(|w| Some((*w.first()?, *w.get(1)?))).collect();
+    let segs2: Vec<(Coord, Coord)> = ring2.windows(2).filter_map(|w| Some((*w.first()?, *w.get(1)?))).collect();
+    for a in &segs1 {
+        for b in &segs2 {
+            if let Some(c) = segments_cross(*a, *b) {
+                return Some(c);
+            }
+        }
+    }
+    ring2.first().copied().or_else(|| ring1.first().copied())
+}
+
 /// Converts RustGIS polygon rings into a `geo::MultiPolygon<f64>` in native coordinates.
 fn to_geo_multipolygon(polys: &[Vec<Vec<Coord>>]) -> Option<geo::MultiPolygon<f64>> {
-    let mut geo_polys = Vec::with_capacity(polys.len());
+    let mut geo_polys = Vec::new();
     for rings in polys {
         let mut it = rings.iter();
-        let exterior_coords = it.next()?;
+        let Some(exterior_coords) = it.next() else { continue };
+        if exterior_coords.is_empty() {
+            continue;
+        }
         let exterior = geo::LineString::new(exterior_coords.iter().copied().map(to_geo_coord).collect());
         let interiors = it.map(|hole| geo::LineString::new(hole.iter().copied().map(to_geo_coord).collect())).collect();
         geo_polys.push(geo::Polygon::new(exterior, interiors));
+    }
+    if geo_polys.is_empty() {
+        return None;
     }
     Some(geo::MultiPolygon::new(geo_polys))
 }
@@ -263,6 +305,32 @@ fn validate_line(parts: &[Vec<Coord>], feature_id: u64) -> ValidationRecord {
                 error_location: part.first().copied(),
             };
         }
+
+        match check_self_crossing(part, false) {
+            CrossingCheck::Crossing(cross_loc) => {
+                return ValidationRecord {
+                    feature_id,
+                    geometry_type: "Polyline",
+                    status: ValidityStatus::Invalid,
+                    valid: false,
+                    error_category: ValidityCategory::SelfIntersection,
+                    error_reason: format!("Polyline part {part_idx} self-intersects at ({:.6}, {:.6})", cross_loc.x, cross_loc.y),
+                    error_location: Some(cross_loc),
+                };
+            }
+            CrossingCheck::BudgetExceeded => {
+                return ValidationRecord {
+                    feature_id,
+                    geometry_type: "Polyline",
+                    status: ValidityStatus::Error,
+                    valid: false,
+                    error_category: ValidityCategory::ProcessingError,
+                    error_reason: format!("Polyline part {part_idx}: work budget exceeded during self-intersection check"),
+                    error_location: part.first().copied(),
+                };
+            }
+            CrossingCheck::None => {}
+        }
     }
 
     ValidationRecord {
@@ -344,16 +412,30 @@ fn validate_polygon(polys: &[Vec<Vec<Coord>>], feature_id: u64) -> ValidationRec
             }
 
             // 1d. Ring self-crossing
-            if let Some(cross_loc) = self_crossing(ring, true) {
-                return ValidationRecord {
-                    feature_id,
-                    geometry_type: "Polygon",
-                    status: ValidityStatus::Invalid,
-                    valid: false,
-                    error_category: ValidityCategory::SelfIntersection,
-                    error_reason: format!("{role} in polygon {poly_idx} self-intersects at ({:.6}, {:.6})", cross_loc.x, cross_loc.y),
-                    error_location: Some(cross_loc),
-                };
+            match check_self_crossing(ring, true) {
+                CrossingCheck::Crossing(cross_loc) => {
+                    return ValidationRecord {
+                        feature_id,
+                        geometry_type: "Polygon",
+                        status: ValidityStatus::Invalid,
+                        valid: false,
+                        error_category: ValidityCategory::SelfIntersection,
+                        error_reason: format!("{role} in polygon {poly_idx} self-intersects at ({:.6}, {:.6})", cross_loc.x, cross_loc.y),
+                        error_location: Some(cross_loc),
+                    };
+                }
+                CrossingCheck::BudgetExceeded => {
+                    return ValidationRecord {
+                        feature_id,
+                        geometry_type: "Polygon",
+                        status: ValidityStatus::Error,
+                        valid: false,
+                        error_category: ValidityCategory::ProcessingError,
+                        error_reason: format!("{role} in polygon {poly_idx}: work budget exceeded during self-intersection check"),
+                        error_location: ring.first().copied(),
+                    };
+                }
+                CrossingCheck::None => {}
             }
         }
     }
@@ -401,7 +483,10 @@ fn interpret_geo_multipolygon_error(err: InvalidMultiPolygon, polys: &[Vec<Vec<C
                             RingRole::Exterior => 0,
                             RingRole::Interior(i) => i + 1,
                         };
-                        rings.get(r_idx).and_then(|r| self_crossing(r, true).or_else(|| r.first().copied()))
+                        rings.get(r_idx).and_then(|r| match check_self_crossing(r, true) {
+                            CrossingCheck::Crossing(c) => Some(c),
+                            _ => r.first().copied(),
+                        })
                     });
                     ValidationRecord {
                         feature_id,
@@ -466,33 +551,58 @@ fn interpret_geo_multipolygon_error(err: InvalidMultiPolygon, polys: &[Vec<Vec<C
                     error_location: None,
                 },
                 InvalidPolygon::IntersectingRingsOnAnArea(r1, r2) => {
-                    let loc = polys.get(p_idx).and_then(|rings| rings.get(1)).and_then(|h| h.first().copied());
+                    let r1_label = ring_role_label(r1);
+                    let r2_label = ring_role_label(r2);
+                    let r1_idx = ring_role_index(r1);
+                    let r2_idx = ring_role_index(r2);
+                    let loc = polys.get(p_idx).and_then(|rings| {
+                        let ring1 = rings.get(r1_idx)?;
+                        let ring2 = rings.get(r2_idx)?;
+                        find_rings_intersection(ring1, ring2)
+                    });
                     ValidationRecord {
                         feature_id,
                         geometry_type: "Polygon",
                         status: ValidityStatus::Invalid,
                         valid: false,
                         error_category: ValidityCategory::HolesOverlap,
-                        error_reason: format!("interior rings {r1:?} and {r2:?} in polygon {p_idx} overlap on an area"),
+                        error_reason: format!("{r1_label} and {r2_label} in polygon {p_idx} overlap on an area"),
                         error_location: loc,
                     }
                 }
                 InvalidPolygon::IntersectingRingsOnALine(r1, r2) => {
-                    let loc = polys.get(p_idx).and_then(|rings| rings.get(1)).and_then(|h| h.first().copied());
+                    let r1_label = ring_role_label(r1);
+                    let r2_label = ring_role_label(r2);
+                    let r1_idx = ring_role_index(r1);
+                    let r2_idx = ring_role_index(r2);
+                    let loc = polys.get(p_idx).and_then(|rings| {
+                        let ring1 = rings.get(r1_idx)?;
+                        let ring2 = rings.get(r2_idx)?;
+                        find_rings_intersection(ring1, ring2)
+                    });
                     ValidationRecord {
                         feature_id,
                         geometry_type: "Polygon",
                         status: ValidityStatus::Invalid,
                         valid: false,
                         error_category: ValidityCategory::HolesOverlap,
-                        error_reason: format!("rings {r1:?} and {r2:?} in polygon {p_idx} touch or intersect on a line"),
+                        error_reason: format!("rings {r1_label} and {r2_label} in polygon {p_idx} touch or intersect on a line"),
                         error_location: loc,
                     }
                 }
             }
         }
         InvalidMultiPolygon::ElementsOverlaps(idx1, idx2) => {
-            let loc = polys.get(idx1.0).and_then(|rings| rings.first()).and_then(|r| r.first().copied());
+            let loc = polys
+                .get(idx1.0)
+                .and_then(|p1| {
+                    polys.get(idx2.0).and_then(|p2| {
+                        let r1 = p1.first()?;
+                        let r2 = p2.first()?;
+                        find_rings_intersection(r1, r2)
+                    })
+                })
+                .or_else(|| polys.get(idx2.0).and_then(|rings| rings.first()).and_then(|r| r.first().copied()));
             ValidationRecord {
                 feature_id,
                 geometry_type: "Polygon",
@@ -504,7 +614,16 @@ fn interpret_geo_multipolygon_error(err: InvalidMultiPolygon, polys: &[Vec<Vec<C
             }
         }
         InvalidMultiPolygon::ElementsTouchOnALine(idx1, idx2) => {
-            let loc = polys.get(idx1.0).and_then(|rings| rings.first()).and_then(|r| r.first().copied());
+            let loc = polys
+                .get(idx1.0)
+                .and_then(|p1| {
+                    polys.get(idx2.0).and_then(|p2| {
+                        let r1 = p1.first()?;
+                        let r2 = p2.first()?;
+                        find_rings_intersection(r1, r2)
+                    })
+                })
+                .or_else(|| polys.get(idx2.0).and_then(|rings| rings.first()).and_then(|r| r.first().copied()));
             ValidationRecord {
                 feature_id,
                 geometry_type: "Polygon",
@@ -520,11 +639,17 @@ fn interpret_geo_multipolygon_error(err: InvalidMultiPolygon, polys: &[Vec<Vec<C
 
 /// Automatically repairs an invalid geometry while preserving its spatial meaning.
 pub fn fix_geometry(geom: &Geometry) -> FixOutcome {
+    let (outcome, _) = fix_geometry_with_stats(geom);
+    outcome
+}
+
+/// Automatically repairs an invalid geometry and returns repair statistics.
+pub fn fix_geometry_with_stats(geom: &Geometry) -> (FixOutcome, FixStats) {
     match geom {
-        Geometry::Point(c) => fix_point(*c),
-        Geometry::MultiPoint(pts) => fix_multipoint(pts),
-        Geometry::Line(parts) => fix_line(parts),
-        Geometry::Polygon(polys) => fix_polygon(polys),
+        Geometry::Point(c) => (fix_point(*c), FixStats::default()),
+        Geometry::MultiPoint(pts) => fix_multipoint_with_stats(pts),
+        Geometry::Line(parts) => fix_line_with_stats(parts),
+        Geometry::Polygon(polys) => fix_polygon_with_stats(polys),
     }
 }
 
@@ -536,83 +661,170 @@ fn fix_point(c: Coord) -> FixOutcome {
     }
 }
 
-fn fix_multipoint(pts: &[Coord]) -> FixOutcome {
-    let clean: Vec<Coord> = pts.iter().copied().filter(|c| c.is_finite()).collect();
-    if clean.is_empty() {
-        return FixOutcome::Failed("all points were non-finite".into());
+fn fix_multipoint_with_stats(pts: &[Coord]) -> (FixOutcome, FixStats) {
+    let mut stats = FixStats::default();
+    if pts.is_empty() {
+        return (FixOutcome::Skipped("MultiPoint has no coordinates"), stats);
     }
-    if clean.len() == pts.len() {
-        FixOutcome::Unchanged(Geometry::MultiPoint(pts.to_vec()))
+    let clean: Vec<Coord> = pts.iter().copied().filter(|c| c.is_finite()).collect();
+    let dropped = pts.len() - clean.len();
+    stats.dropped_non_finite = dropped;
+    if clean.is_empty() {
+        return (FixOutcome::Failed("all points were non-finite (NaN or Inf)".into()), stats);
+    }
+    if dropped == 0 {
+        (FixOutcome::Unchanged(Geometry::MultiPoint(pts.to_vec())), stats)
     } else {
-        FixOutcome::Repaired(Geometry::MultiPoint(clean))
+        (FixOutcome::Repaired(Geometry::MultiPoint(clean)), stats)
     }
 }
 
-fn fix_line(parts: &[Vec<Coord>]) -> FixOutcome {
+fn fix_line_with_stats(parts: &[Vec<Coord>]) -> (FixOutcome, FixStats) {
+    let mut stats = FixStats::default();
+    if parts.is_empty() || parts.iter().all(|p| p.is_empty()) {
+        return (FixOutcome::Skipped("polyline has no vertices or parts"), stats);
+    }
+
     let mut clean_parts: Vec<Vec<Coord>> = Vec::new();
     let mut modified = false;
 
-    for part in parts {
-        let mut clean: Vec<Coord> = part.iter().copied().filter(|c| c.is_finite()).collect();
-        let orig_len = clean.len();
-        clean.dedup();
-        if clean.len() != orig_len || clean.len() != part.len() {
+    for (part_idx, part) in parts.iter().enumerate() {
+        let mut clean: Vec<Coord> = Vec::with_capacity(part.len());
+        let mut non_finite_in_part = 0usize;
+        for c in part {
+            if c.is_finite() {
+                clean.push(*c);
+            } else {
+                non_finite_in_part += 1;
+            }
+        }
+        if non_finite_in_part > 0 {
+            stats.dropped_non_finite += non_finite_in_part;
             modified = true;
         }
+
+        let orig_clean_len = clean.len();
+        clean.dedup();
+        if clean.len() != orig_clean_len {
+            modified = true;
+        }
+
         if clean.len() >= 2 {
+            match check_self_crossing(&clean, false) {
+                CrossingCheck::Crossing(c) => {
+                    return (
+                        FixOutcome::Failed(format!(
+                            "polyline part {part_idx} self-intersects at ({:.6}, {:.6}) and cannot be automatically repaired",
+                            c.x, c.y
+                        )),
+                        stats,
+                    );
+                }
+                CrossingCheck::BudgetExceeded => {
+                    return (FixOutcome::Failed("work budget exceeded during self-intersection check".into()), stats);
+                }
+                CrossingCheck::None => {}
+            }
             clean_parts.push(clean);
         } else {
+            stats.dropped_parts += 1;
             modified = true;
         }
     }
 
     if clean_parts.is_empty() {
-        return FixOutcome::Failed("all line parts collapsed to degenerate (fewer than 2 points)".into());
+        return (FixOutcome::Failed("all line parts collapsed to degenerate (fewer than 2 points)".into()), stats);
     }
 
     if !modified && clean_parts.len() == parts.len() {
-        FixOutcome::Unchanged(Geometry::Line(parts.to_vec()))
+        (FixOutcome::Unchanged(Geometry::Line(parts.to_vec())), stats)
     } else {
-        FixOutcome::Repaired(Geometry::Line(clean_parts))
+        (FixOutcome::Repaired(Geometry::Line(clean_parts)), stats)
     }
 }
 
-fn fix_polygon(polys: &[Vec<Vec<Coord>>]) -> FixOutcome {
+fn clean_ring_coords(ring: &[Coord]) -> (Vec<Coord>, usize) {
+    let mut clean: Vec<Coord> = Vec::with_capacity(ring.len());
+    let mut dropped_non_finite = 0usize;
+    for c in ring {
+        if c.is_finite() {
+            clean.push(*c);
+        } else {
+            dropped_non_finite += 1;
+        }
+    }
+    clean.dedup();
+    if let Some(first) = clean.first().copied()
+        && clean.last() != Some(&first)
+    {
+        clean.push(first);
+    }
+    (clean, dropped_non_finite)
+}
+
+fn fix_polygon_with_stats(polys: &[Vec<Vec<Coord>>]) -> (FixOutcome, FixStats) {
+    let mut stats = FixStats::default();
     if polys.is_empty() || polys.iter().all(|rings| rings.is_empty()) {
-        return FixOutcome::Failed("polygon has no rings or coordinates".into());
+        return (FixOutcome::Skipped("polygon has no rings or coordinates"), stats);
     }
 
     // Fast path: if already valid, keep 100% bitwise coordinates intact.
     let validation = validate_polygon(polys, 0);
     if validation.valid {
-        return FixOutcome::Unchanged(Geometry::Polygon(polys.to_vec()));
+        return (FixOutcome::Unchanged(Geometry::Polygon(polys.to_vec())), stats);
+    }
+    if validation.status == ValidityStatus::Error {
+        return (FixOutcome::Failed("work budget exceeded during validation; cannot determine validity safely".into()), stats);
     }
 
     // Step 1: Pre-clean rings (filter non-finite, dedup consecutive duplicate vertices, ensure closed)
     let mut cleaned_polys: Vec<geo::Polygon<f64>> = Vec::new();
     for rings in polys {
-        let mut cleaned_rings: Vec<geo::LineString<f64>> = Vec::new();
-        for ring in rings {
-            let mut pts: Vec<Coord> = ring.iter().copied().filter(|c| c.is_finite()).collect();
-            pts.dedup();
-            if let Some(first) = pts.first().copied()
-                && pts.last() != Some(&first)
-            {
-                pts.push(first);
+        let mut ring_iter = rings.iter();
+        let Some(exterior_ring) = ring_iter.next() else {
+            stats.dropped_components += 1;
+            continue;
+        };
+
+        let (clean_ext, non_finite_ext) = clean_ring_coords(exterior_ring);
+        stats.dropped_non_finite += non_finite_ext;
+
+        let mut distinct_ext = clean_ext.clone();
+        distinct_ext.dedup();
+        if distinct_ext.len() >= 2 && distinct_ext.first() == distinct_ext.last() {
+            distinct_ext.pop();
+        }
+
+        if clean_ext.len() < 4 || distinct_ext.len() < 3 {
+            // Exterior ring collapsed: do not promote a hole to the exterior shell!
+            stats.dropped_components += 1;
+            continue;
+        }
+
+        let mut cleaned_interiors = Vec::new();
+        for hole in ring_iter {
+            let (clean_hole, non_finite_hole) = clean_ring_coords(hole);
+            stats.dropped_non_finite += non_finite_hole;
+
+            let mut distinct_hole = clean_hole.clone();
+            distinct_hole.dedup();
+            if distinct_hole.len() >= 2 && distinct_hole.first() == distinct_hole.last() {
+                distinct_hole.pop();
             }
-            if pts.len() >= 4 {
-                let ls = geo::LineString::new(pts.into_iter().map(to_geo_coord).collect());
-                cleaned_rings.push(ls);
+
+            if clean_hole.len() >= 4 && distinct_hole.len() >= 3 {
+                cleaned_interiors.push(geo::LineString::new(clean_hole.into_iter().map(to_geo_coord).collect()));
+            } else {
+                stats.dropped_holes += 1;
             }
         }
-        if let Some(exterior) = cleaned_rings.first().cloned() {
-            let interiors = cleaned_rings.get(1..).map(<[geo::LineString<f64>]>::to_vec).unwrap_or_default();
-            cleaned_polys.push(geo::Polygon::new(exterior, interiors));
-        }
+
+        let exterior_ls = geo::LineString::new(clean_ext.into_iter().map(to_geo_coord).collect());
+        cleaned_polys.push(geo::Polygon::new(exterior_ls, cleaned_interiors));
     }
 
     if cleaned_polys.is_empty() {
-        return FixOutcome::Failed("all polygon rings collapsed to degenerate".into());
+        return (FixOutcome::Failed("all polygon components collapsed to degenerate".into()), stats);
     }
 
     let input_mp = geo::MultiPolygon::new(cleaned_polys);
@@ -621,17 +833,17 @@ fn fix_polygon(polys: &[Vec<Vec<Coord>>]) -> FixOutcome {
     match input_mp.make_valid() {
         Ok(repaired_mp) => {
             if repaired_mp.0.is_empty() {
-                return FixOutcome::Failed("polygon collapsed to empty during repair".into());
+                return (FixOutcome::Failed("polygon collapsed to empty during repair".into()), stats);
             }
             let area: f64 = repaired_mp.0.iter().map(|p| p.unsigned_area()).sum();
             if area <= 1e-14 {
-                return FixOutcome::Failed("repaired polygon has zero area".into());
+                return (FixOutcome::Failed("repaired polygon has zero area".into()), stats);
             }
 
             let new_geom = from_geo_multipolygon(&repaired_mp);
-            FixOutcome::Repaired(new_geom)
+            (FixOutcome::Repaired(new_geom), stats)
         }
-        Err(err) => FixOutcome::Failed(format!("repair failed: {err}")),
+        Err(err) => (FixOutcome::Failed(format!("repair failed: {err}")), stats),
     }
 }
 
@@ -758,6 +970,15 @@ pub fn fix_geometries(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     let mut skipped_count = 0usize;
     let mut failed_details: Vec<String> = Vec::new();
 
+    let mut total_dropped_non_finite = 0usize;
+    let mut features_with_dropped_non_finite = 0usize;
+    let mut total_dropped_parts = 0usize;
+    let mut features_with_dropped_parts = 0usize;
+    let mut total_dropped_holes = 0usize;
+    let mut features_with_dropped_holes = 0usize;
+    let mut total_dropped_components = 0usize;
+    let mut features_with_dropped_components = 0usize;
+
     crate::control::begin(total);
     for (i, &row_idx) in target_rows.iter().enumerate() {
         if crate::control::cancelled() {
@@ -773,7 +994,26 @@ pub fn fix_geometries(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
             continue;
         };
 
-        match fix_geometry(g) {
+        let (outcome, stats) = fix_geometry_with_stats(g);
+
+        if stats.dropped_non_finite > 0 {
+            total_dropped_non_finite += stats.dropped_non_finite;
+            features_with_dropped_non_finite += 1;
+        }
+        if stats.dropped_parts > 0 {
+            total_dropped_parts += stats.dropped_parts;
+            features_with_dropped_parts += 1;
+        }
+        if stats.dropped_holes > 0 {
+            total_dropped_holes += stats.dropped_holes;
+            features_with_dropped_holes += 1;
+        }
+        if stats.dropped_components > 0 {
+            total_dropped_components += stats.dropped_components;
+            features_with_dropped_components += 1;
+        }
+
+        match outcome {
             FixOutcome::Unchanged(orig) => {
                 unchanged_count += 1;
                 out_ds.push_next(Some(orig), f.attrs.clone());
@@ -804,6 +1044,27 @@ pub fn fix_geometries(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
 
     if failed_count > 0 {
         messages.push(format!("Failed repairs (original geometries preserved): {}", failed_details.join("; ")));
+    }
+
+    if total_dropped_non_finite > 0 {
+        messages.push(format!(
+            "{total_dropped_non_finite} non-finite coordinate(s) dropped across {features_with_dropped_non_finite} feature(s)."
+        ));
+    }
+    if total_dropped_parts > 0 {
+        messages.push(format!(
+            "{total_dropped_parts} degenerate line part(s) (fewer than 2 points) dropped across {features_with_dropped_parts} feature(s)."
+        ));
+    }
+    if total_dropped_holes > 0 {
+        messages.push(format!(
+            "{total_dropped_holes} degenerate interior ring(s) (holes) dropped across {features_with_dropped_holes} feature(s)."
+        ));
+    }
+    if total_dropped_components > 0 {
+        messages.push(format!(
+            "{total_dropped_components} degenerate polygon component(s) dropped across {features_with_dropped_components} feature(s)."
+        ));
     }
 
     Ok(ToolResult { output: Output::Layer(out_ds), messages })
@@ -962,7 +1223,7 @@ mod tests {
     }
 
     #[test]
-    fn test_consecutive_duplicate_vertices_repair() {
+    fn test_valid_polygon_with_duplicates_is_unchanged() {
         let dup = Geometry::Polygon(vec![vec![vec![
             Coord::new(0.0, 0.0),
             Coord::new(0.0, 0.0),
@@ -973,11 +1234,82 @@ mod tests {
             Coord::new(0.0, 0.0),
         ]]]);
         let fix = fix_geometry(&dup);
-        let FixOutcome::Unchanged(_) = fix else {
-            // If treated as repaired or unchanged, must be valid
-            let FixOutcome::Repaired(r) = fix else { panic!("expected Repaired or Unchanged") };
-            assert!(validate_geometry(Some(&r), 1, GeometryType::Polygon).valid);
-            return;
-        };
+        // Valid geometry preserves bitwise identical coordinates without modification
+        assert_eq!(fix, FixOutcome::Unchanged(dup));
+    }
+
+    #[test]
+    fn test_invalid_polygon_with_duplicates_deduped_on_repair() {
+        // An unclosed polygon that also has duplicate consecutive vertices
+        let dup_unclosed = Geometry::Polygon(vec![vec![vec![
+            Coord::new(0.0, 0.0),
+            Coord::new(0.0, 0.0),
+            Coord::new(10.0, 0.0),
+            Coord::new(10.0, 10.0),
+            Coord::new(10.0, 10.0),
+            Coord::new(0.0, 10.0),
+        ]]]);
+        let fix = fix_geometry(&dup_unclosed);
+        let FixOutcome::Repaired(repaired) = fix else { panic!("expected Repaired, got {fix:?}") };
+        let Geometry::Polygon(polys) = &repaired else { panic!("expected Polygon") };
+        assert_eq!(polys.len(), 1);
+        let ring = &polys[0][0];
+        // After repair: ring is closed and consecutive duplicates are removed (5 vertices: 4 distinct + closure)
+        assert_eq!(ring.len(), 5);
+        assert_eq!(ring.first(), ring.last());
+        let rec = validate_geometry(Some(&repaired), 1, GeometryType::Polygon);
+        assert_eq!(rec.status, ValidityStatus::Valid);
+    }
+
+    #[test]
+    fn test_exterior_ring_collapse_fails_without_promoting_hole() {
+        // Exterior ring is collapsed (all points identical [A, A, A, A]), but hole is valid
+        let collapsed_exterior = Geometry::Polygon(vec![vec![
+            vec![Coord::new(0.0, 0.0), Coord::new(0.0, 0.0), Coord::new(0.0, 0.0), Coord::new(0.0, 0.0)],
+            vec![Coord::new(2.0, 2.0), Coord::new(8.0, 2.0), Coord::new(8.0, 8.0), Coord::new(2.0, 8.0), Coord::new(2.0, 2.0)],
+        ]]);
+        let fix = fix_geometry(&collapsed_exterior);
+        // Must NOT return Repaired with the hole promoted to shell!
+        assert!(matches!(fix, FixOutcome::Failed(_)), "expected Failed, got {fix:?}");
+    }
+
+    #[test]
+    fn test_self_intersecting_polyline() {
+        // Self-intersecting polyline
+        let line = Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(2.0, 2.0), Coord::new(0.0, 2.0), Coord::new(2.0, 0.0)]]);
+        let rec = validate_geometry(Some(&line), 1, GeometryType::Polyline);
+        assert_eq!(rec.status, ValidityStatus::Invalid);
+        assert_eq!(rec.error_category, ValidityCategory::SelfIntersection);
+        assert!(rec.error_location.is_some());
+        let loc = rec.error_location.unwrap();
+        assert!((loc.x - 1.0).abs() < 1e-4 && (loc.y - 1.0).abs() < 1e-4);
+
+        let fix = fix_geometry(&line);
+        assert!(matches!(fix, FixOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn test_multipoint_empty_and_lossy_repair() {
+        let empty_mp = Geometry::MultiPoint(vec![]);
+        let (fix_empty, _) = fix_geometry_with_stats(&empty_mp);
+        assert!(matches!(fix_empty, FixOutcome::Skipped(_)));
+
+        let lossy_mp = Geometry::MultiPoint(vec![Coord::new(1.0, 2.0), Coord::new(f64::NAN, 3.0)]);
+        let (fix_lossy, stats) = fix_geometry_with_stats(&lossy_mp);
+        assert_eq!(stats.dropped_non_finite, 1);
+        let FixOutcome::Repaired(Geometry::MultiPoint(clean)) = fix_lossy else { panic!("expected Repaired") };
+        assert_eq!(clean, vec![Coord::new(1.0, 2.0)]);
+    }
+
+    #[test]
+    fn test_line_part_dropped_stats() {
+        // Multipart line with one valid part and one collapsed part [A, A]
+        let line =
+            Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(10.0, 10.0)], vec![Coord::new(5.0, 5.0), Coord::new(5.0, 5.0)]]);
+        let (fix, stats) = fix_geometry_with_stats(&line);
+        assert_eq!(stats.dropped_parts, 1);
+        let FixOutcome::Repaired(Geometry::Line(parts)) = fix else { panic!("expected Repaired") };
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].len(), 2);
     }
 }

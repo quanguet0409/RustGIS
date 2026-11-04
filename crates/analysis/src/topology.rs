@@ -149,7 +149,7 @@ pub fn gaps(ds: &Dataset, rows: &[usize]) -> Checked {
     Checked::done(out)
 }
 
-fn segments_cross(a: (Coord, Coord), b: (Coord, Coord)) -> Option<Coord> {
+pub(crate) fn segments_cross(a: (Coord, Coord), b: (Coord, Coord)) -> Option<Coord> {
     let d = (a.1.x - a.0.x) * (b.1.y - b.0.y) - (a.1.y - a.0.y) * (b.1.x - b.0.x);
     if d.abs() < 1e-12 {
         return None;
@@ -161,10 +161,17 @@ fn segments_cross(a: (Coord, Coord), b: (Coord, Coord)) -> Option<Coord> {
     (t > e && t < 1.0 - e && u > e && u < 1.0 - e).then(|| Coord::new(a.0.x + t * (a.1.x - a.0.x), a.0.y + t * (a.1.y - a.0.y)))
 }
 
+/// Result of checking whether a path crosses itself.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum CrossingCheck {
+    None,
+    Crossing(Coord),
+    BudgetExceeded,
+}
+
 /// Where a path crosses itself (rings and lines; ring closures are allowed). Segments are swept
-/// west to east, so only those overlapping in x are compared. A path too complex to finish
-/// within the work budget is reported at its start, to be looked at, rather than passed.
-pub(crate) fn self_crossing(path: &[Coord], closed: bool) -> Option<Coord> {
+/// west to east, so only those overlapping in x are compared.
+pub(crate) fn check_self_crossing(path: &[Coord], closed: bool) -> CrossingCheck {
     let segs: Vec<(Coord, Coord)> = path.windows(2).filter_map(|w| Some((*w.first()?, *w.get(1)?))).collect();
     let n = segs.len();
     let minx = |s: &(Coord, Coord)| s.0.x.min(s.1.x);
@@ -184,7 +191,7 @@ pub(crate) fn self_crossing(path: &[Coord], closed: bool) -> Option<Coord> {
             }
             work += 1;
             if work > MAX_WORK {
-                return path.first().copied();
+                return CrossingCheck::BudgetExceeded;
             }
             let (lo, hi) = (i.min(j), i.max(j));
             // Neighbouring segments share a vertex, as do a ring's first and last.
@@ -192,11 +199,22 @@ pub(crate) fn self_crossing(path: &[Coord], closed: bool) -> Option<Coord> {
                 continue;
             }
             if let Some(c) = segments_cross(*a, *b) {
-                return Some(c);
+                return CrossingCheck::Crossing(c);
             }
         }
     }
-    None
+    CrossingCheck::None
+}
+
+/// Where a path crosses itself (rings and lines; ring closures are allowed). Segments are swept
+/// west to east, so only those overlapping in x are compared. A path too complex to finish
+/// within the work budget is reported at its start, to be looked at, rather than passed.
+pub(crate) fn self_crossing(path: &[Coord], closed: bool) -> Option<Coord> {
+    match check_self_crossing(path, closed) {
+        CrossingCheck::Crossing(c) => Some(c),
+        CrossingCheck::BudgetExceeded => path.first().copied(),
+        CrossingCheck::None => None,
+    }
 }
 
 /// Lines and polygon rings that cross themselves.

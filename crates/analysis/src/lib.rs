@@ -44,7 +44,8 @@ pub use parallel::scratch_budget;
 pub use parameters::StatisticList;
 pub use tools::{TOOLS, find_field_case_insensitive, holds_coordinates, max_buffer_bytes, param_applies, simplify_geometry, zonal_bands};
 pub use validity::{
-    FixOutcome, ValidationRecord, ValidityCategory, ValidityStatus, check_geometry, fix_geometries, fix_geometry, validate_geometry,
+    FixOutcome, FixStats, ValidationRecord, ValidityCategory, ValidityStatus, check_geometry, fix_geometries, fix_geometry,
+    fix_geometry_with_stats, validate_geometry,
 };
 
 use rustgis_data::Dataset;

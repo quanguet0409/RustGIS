@@ -838,17 +838,19 @@ The **Check Geometry** (`checkGeometry`) and **Fix Geometries** (`fixGeometries`
 vector geometry validity issues according to the OGC Simple Features Specification (SFS).
 
 - **Check Geometry** inspects feature geometries in native coordinate space without projection distortion.
-  It detects self-intersections (e.g. bow-ties and loops), unclosed rings, rings with too few points (< 3 distinct vertices),
+  It detects self-intersections (e.g. bow-ties and crossing lines/loops), unclosed rings, rings with too few points (< 3 distinct vertices),
   interior holes outside their exterior shells, overlapping or touching interior rings, overlapping MultiPolygon components,
   and non-finite coordinates. It outputs a standalone validation report table (`<input>_Validation`) containing:
   `feature_id`, `geometry_type`, `status` (`Valid`, `Invalid`, `Empty`, `Null`, `Unsupported`, `Error`), `valid` (boolean),
-  `error_category`, `error_reason`, and problem coordinates (`error_x`, `error_y`).
+  `error_category`, `error_reason`, and problem coordinates (`error_x`, `error_y`) pinpointing the issue location.
 - **Fix Geometries** repairs invalid geometries automatically using constrained Delaunay triangulation
-  ([Hugo Ledoux et al., 2014](http://dx.doi.org/10.1016/j.cageo.2014.01.009)). It closes unclosed rings, decomposes
-  self-intersecting polygons into valid components, re-nests holes, and collapses degenerate slivers. Already-valid features
-  are preserved with 100% bitwise identical coordinates. All feature attributes, layer CRS, and metadata are retained in
-  the output layer (`<input>_Fixed`). Features that cannot be repaired (e.g. non-finite coordinates or collapsed to zero area)
-  are preserved with their original geometry and reported with counted notices rather than silently dropped.
+  ([Hugo Ledoux et al., 2014](http://dx.doi.org/10.1016/j.cageo.2014.01.009)). Already-valid features are preserved
+  with 100% bitwise identical coordinates. During repair of invalid geometries, consecutive duplicate vertices are removed,
+  unclosed rings are closed, self-intersecting polygons are decomposed into valid components, holes are re-nested, and degenerate
+  slivers are collapsed. Any dropped non-finite coordinates, collapsed line parts, or degenerate holes are counted and reported
+  via notices. All feature attributes, layer CRS, and metadata are retained in the output layer (`<input>_Fixed`). Features that
+  cannot be automatically repaired (e.g. collapsed exterior shells or unrepairable line self-crossings) are preserved with their
+  original geometry and reported with counted summaries rather than silently dropped.
 
 ```text
 gp.run={"tool":"checkGeometry","params":{"input":"Parcels","output":"Parcels_Validation"}}
