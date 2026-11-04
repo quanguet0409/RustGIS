@@ -164,7 +164,7 @@ fn segments_cross(a: (Coord, Coord), b: (Coord, Coord)) -> Option<Coord> {
 /// Where a path crosses itself (rings and lines; ring closures are allowed). Segments are swept
 /// west to east, so only those overlapping in x are compared. A path too complex to finish
 /// within the work budget is reported at its start, to be looked at, rather than passed.
-fn self_crossing(path: &[Coord], closed: bool) -> Option<Coord> {
+pub(crate) fn self_crossing(path: &[Coord], closed: bool) -> Option<Coord> {
     let segs: Vec<(Coord, Coord)> = path.windows(2).filter_map(|w| Some((*w.first()?, *w.get(1)?))).collect();
     let n = segs.len();
     let minx = |s: &(Coord, Coord)| s.0.x.min(s.1.x);

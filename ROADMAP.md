@@ -63,7 +63,6 @@ Correct, robust and recoverable, with the foundations other themes stand on.
   administrator can fix for a managed install (no AI Assistant, plugins or web services).
 - Extend the OS keychain secret store to service connections (database passwords, S3 keys,
   AI provider keys and the ChatGPT sign-in's tokens are already kept there).
-- Vector tools, each writing a new layer: check and fix geometry _(open)_.
 - Batch runs: one tool over many layers or a folder of files.
 
 ### Expressions and cartography
@@ -149,6 +148,9 @@ Open questions rather than plans; discuss before building.
 
 ## Done
 
+- Check and Fix Geometry: validate vector geometries against OGC SFS rules (self-intersections,
+  unclosed rings, invalid interior holes) and repair geometries via constrained Delaunay
+  triangulation, available in the Tools pane and through `gp.run`.
 - Polygon editing: Cut Polygon, Reshape (polygons and lines) and Trace along an edge while
   drawing, on the map and through `edit.cutPolygon`, `edit.reshape` and `edit.trace`.
 - Geometry conversions: Polygon To Line, Split Line At Vertices, Feature Envelope To Polygon

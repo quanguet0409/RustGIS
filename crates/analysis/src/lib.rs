@@ -32,6 +32,7 @@ pub mod tissot;
 mod tools;
 pub mod topology;
 pub mod trend;
+pub mod validity;
 pub mod warp;
 
 pub use attribute_join::{DuplicateStrategy, JoinFieldOptions, JoinFieldReport, join_field};
@@ -42,6 +43,9 @@ pub use density::{
 pub use parallel::scratch_budget;
 pub use parameters::StatisticList;
 pub use tools::{TOOLS, find_field_case_insensitive, holds_coordinates, max_buffer_bytes, param_applies, simplify_geometry, zonal_bands};
+pub use validity::{
+    FixOutcome, ValidationRecord, ValidityCategory, ValidityStatus, check_geometry, fix_geometries, fix_geometry, validate_geometry,
+};
 
 use rustgis_data::Dataset;
 use serde_json::Value;

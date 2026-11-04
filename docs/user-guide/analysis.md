@@ -140,6 +140,8 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 | Split Line At Vertices | `splitLineAtVertices` | Data Management › Features |
 | Feature Envelope To Polygon | `featureEnvelopeToPolygon` | Data Management › Features |
 | Unsplit Line | `unsplitLine` | Data Management › Features |
+| Check Geometry | `checkGeometry` | Data Management › Features |
+| Fix Geometries | `fixGeometries` | Data Management › Features |
 | XY Table To Point | `xyTableToPoint` | Data Management › Features |
 | Calculate Geometry Attributes | `calculateGeometry` | Data Management › Features |
 | Simplify | `simplify` | Cartography › Generalization |
@@ -828,6 +830,29 @@ gp.run={"tool":"polygonToLine","params":{"input":"Regions","output":"Boundaries"
 gp.run={"tool":"splitLineAtVertices","params":{"input":"Rivers"}}
 gp.run={"tool":"featureEnvelopeToPolygon","params":{"input":"Regions"}}
 gp.run={"tool":"unsplitLine","params":{"input":"Rivers"}}
+```
+
+### Check and Fix Geometry
+
+The **Check Geometry** (`checkGeometry`) and **Fix Geometries** (`fixGeometries`) tools detect and repair
+vector geometry validity issues according to the OGC Simple Features Specification (SFS).
+
+- **Check Geometry** inspects feature geometries in native coordinate space without projection distortion.
+  It detects self-intersections (e.g. bow-ties and loops), unclosed rings, rings with too few points (< 3 distinct vertices),
+  interior holes outside their exterior shells, overlapping or touching interior rings, overlapping MultiPolygon components,
+  and non-finite coordinates. It outputs a standalone validation report table (`<input>_Validation`) containing:
+  `feature_id`, `geometry_type`, `status` (`Valid`, `Invalid`, `Empty`, `Null`, `Unsupported`, `Error`), `valid` (boolean),
+  `error_category`, `error_reason`, and problem coordinates (`error_x`, `error_y`).
+- **Fix Geometries** repairs invalid geometries automatically using constrained Delaunay triangulation
+  ([Hugo Ledoux et al., 2014](http://dx.doi.org/10.1016/j.cageo.2014.01.009)). It closes unclosed rings, decomposes
+  self-intersecting polygons into valid components, re-nests holes, and collapses degenerate slivers. Already-valid features
+  are preserved with 100% bitwise identical coordinates. All feature attributes, layer CRS, and metadata are retained in
+  the output layer (`<input>_Fixed`). Features that cannot be repaired (e.g. non-finite coordinates or collapsed to zero area)
+  are preserved with their original geometry and reported with counted notices rather than silently dropped.
+
+```text
+gp.run={"tool":"checkGeometry","params":{"input":"Parcels","output":"Parcels_Validation"}}
+gp.run={"tool":"fixGeometries","params":{"input":"Parcels","output":"Parcels_Fixed"}}
 ```
 
 ## GeoLibre tools

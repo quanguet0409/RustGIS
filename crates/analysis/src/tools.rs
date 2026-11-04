@@ -82,6 +82,42 @@ pub static TOOLS: &[ToolSpec] = &[
         run: geometry::unsplit,
     },
     ToolSpec {
+        id: "checkGeometry",
+        name: "Check Geometry",
+        toolbox: "Data Management › Features",
+        summary: "Validates vector geometries against OGC Simple Features Specification (SFS) rules and produces a detailed validation report.",
+        params: &[
+            P { name: "input", label: "Input Features", kind: K::Layer, required: true, default: "", help: "Vector features to validate." },
+            P {
+                name: "output",
+                label: "Output Table Name",
+                kind: K::Text,
+                required: false,
+                default: "",
+                help: "Name for the validation report table.",
+            },
+        ],
+        run: crate::validity::check_geometry,
+    },
+    ToolSpec {
+        id: "fixGeometries",
+        name: "Fix Geometries",
+        toolbox: "Data Management › Features",
+        summary: "Repairs invalid geometries (self-intersections, unclosed rings, invalid holes) using constrained Delaunay triangulation while preserving attributes and CRS.",
+        params: &[
+            P { name: "input", label: "Input Features", kind: K::Layer, required: true, default: "", help: "Vector features to repair." },
+            P {
+                name: "output",
+                label: "Output Layer Name",
+                kind: K::Text,
+                required: false,
+                default: "",
+                help: "Name for the repaired vector layer.",
+            },
+        ],
+        run: crate::validity::fix_geometries,
+    },
+    ToolSpec {
         id: "buffer",
         name: "Buffer",
         toolbox: "Analysis › Proximity",
