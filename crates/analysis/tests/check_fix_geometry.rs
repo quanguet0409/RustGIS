@@ -324,3 +324,23 @@ fn test_fix_geometries_rejects_standalone_table() {
     let err = rustgis_analysis::run("fixGeometries", &l, &json!({"input": "table_input"})).unwrap_err();
     assert!(err.contains("has no geometry (standalone table)"));
 }
+
+#[test]
+fn test_check_geometry_rejects_standalone_table() {
+    let mut l = create_layer("table_input", GeometryType::None);
+    l.ds.push_next(None, vec![Value::Text("record".into()), Value::Int(1)]);
+    let err = rustgis_analysis::run("checkGeometry", &l, &json!({"input": "table_input"})).unwrap_err();
+    assert!(err.contains("has no geometry (standalone table)"));
+}
+
+#[test]
+fn test_fix_geometries_preserves_empty_geometry() {
+    let mut l = create_layer("empty_polys", GeometryType::Polygon);
+    let empty_poly = Geometry::Polygon(vec![]);
+    l.ds.push_next(Some(empty_poly.clone()), vec![Value::Text("empty".into()), Value::Int(1)]);
+
+    let res = rustgis_analysis::run("fixGeometries", &l, &json!({"input": "empty_polys"})).unwrap();
+    assert!(res.messages[0].contains("1 skipped"));
+    let Output::Layer(out) = res.output else { panic!("expected layer") };
+    assert_eq!(out.features[0].geometry, Some(empty_poly));
+}

@@ -169,6 +169,7 @@ fn find_rings_intersection(ring1: &[Coord], ring2: &[Coord]) -> Option<Coord> {
     // Budget work to avoid quadratic stalls on hostile/dense rings
     let mut work = 0usize;
     const MAX_INTERSECTION_WORK: usize = 50_000;
+    let mut shared_vertex = None;
 
     for a in &segs1 {
         let (a_minx, a_maxx) = (a.0.x.min(a.1.x), a.0.x.max(a.1.x));
@@ -176,19 +177,25 @@ fn find_rings_intersection(ring1: &[Coord], ring2: &[Coord]) -> Option<Coord> {
         for b in &segs2 {
             work += 1;
             if work > MAX_INTERSECTION_WORK {
-                return ring2.first().copied().or_else(|| ring1.first().copied());
+                return shared_vertex.or_else(|| ring2.first().copied()).or_else(|| ring1.first().copied());
             }
             let (b_minx, b_maxx) = (b.0.x.min(b.1.x), b.0.x.max(b.1.x));
             let (b_miny, b_maxy) = (b.0.y.min(b.1.y), b.0.y.max(b.1.y));
             if a_minx > b_maxx || b_minx > a_maxx || a_miny > b_maxy || b_miny > a_maxy {
                 continue;
             }
+            // If segments touch or share an endpoint, remember it for touching ring cases
+            if (a.0 == b.0 || a.0 == b.1) && shared_vertex.is_none() {
+                shared_vertex = Some(a.0);
+            } else if (a.1 == b.0 || a.1 == b.1) && shared_vertex.is_none() {
+                shared_vertex = Some(a.1);
+            }
             if let Some(c) = segments_cross(*a, *b) {
                 return Some(c);
             }
         }
     }
-    ring2.first().copied().or_else(|| ring1.first().copied())
+    shared_vertex.or_else(|| ring2.first().copied()).or_else(|| ring1.first().copied())
 }
 
 /// Converts RustGIS polygon rings into a `geo::MultiPolygon<f64>` in native coordinates,
@@ -558,7 +565,7 @@ fn interpret_geo_multipolygon_error(
                         let r_idx = ring_role_index(role);
                         rings.get(r_idx).and_then(|r| match check_self_crossing(r, true) {
                             CrossingCheck::Crossing(c) => Some(c),
-                            _ => r.first().copied(),
+                            _ => None,
                         })
                     });
                     ValidationRecord {
@@ -597,7 +604,11 @@ fn interpret_geo_multipolygon_error(
                     error_location: None,
                 },
                 InvalidPolygon::InteriorRingNotContainedInExteriorRing(RingRole::Interior(hole_idx)) => {
-                    let loc = polys.get(p_idx).and_then(|rings| rings.get(hole_idx + 1)).and_then(|h| h.first().copied());
+                    let loc = polys.get(p_idx).and_then(|rings| {
+                        let shell = rings.first()?;
+                        let hole = rings.get(hole_idx + 1)?;
+                        find_rings_intersection(shell, hole)
+                    });
                     ValidationRecord {
                         feature_id,
                         geometry_type: "Polygon",
@@ -906,6 +917,9 @@ fn fix_polygon_with_stats(polys: &[Vec<Vec<Coord>>]) -> (FixOutcome, FixStats) {
 
     let input_mp = geo::MultiPolygon::new(cleaned_polys);
 
+    let in_components = input_mp.0.len();
+    let in_holes: usize = input_mp.0.iter().map(|p| p.interiors().len()).sum();
+
     // Step 2: Apply triangulation-based polygon repair (Hugo Ledoux et al., 2014)
     match input_mp.make_valid() {
         Ok(repaired_mp) => {
@@ -916,6 +930,11 @@ fn fix_polygon_with_stats(polys: &[Vec<Vec<Coord>>]) -> (FixOutcome, FixStats) {
             if area <= 1e-14 {
                 return (FixOutcome::Failed("repaired polygon has zero area".into()), stats);
             }
+
+            let out_components = repaired_mp.0.len();
+            let out_holes: usize = repaired_mp.0.iter().map(|p| p.interiors().len()).sum();
+            stats.dropped_holes += in_holes.saturating_sub(out_holes);
+            stats.dropped_components += in_components.saturating_sub(out_components);
 
             let new_geom = from_geo_multipolygon(&repaired_mp);
             (FixOutcome::Repaired(new_geom), stats)
@@ -951,6 +970,9 @@ fn rows(inp: &dyn Inputs, p: &Json, k: &str, ds: &Dataset) -> Vec<usize> {
 /// The runner function for the `checkGeometry` geoprocessing tool.
 pub fn check_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
+    if ds.geometry_type == GeometryType::None {
+        return Err(format!("layer '{}' has no geometry (standalone table)", ds.name));
+    }
     let target_rows = rows(inp, p, "input", ds);
 
     let fields = vec![
@@ -1017,12 +1039,12 @@ pub fn check_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     }
 
     let mut messages = Vec::new();
-    let err_suffix = if error_count > 0 { format!(", {error_count} error") } else { String::new() };
+    let err_suffix = if error_count > 0 { format!(", {error_count} could not be checked") } else { String::new() };
     messages.push(format!(
         "Check Geometry complete: {total} feature(s) checked ({valid_count} valid, {invalid_count} invalid, {empty_count} empty, {null_count} null{err_suffix})."
     ));
 
-    if invalid_count > 0 {
+    if invalid_count > 0 || error_count > 0 {
         let mut breakdown: Vec<String> = category_counts.iter().map(|(cat, count)| format!("{count} {}", cat.as_str())).collect();
         breakdown.sort();
         messages.push(format!("Identified issues: {}.", breakdown.join(", ")));
@@ -1113,7 +1135,8 @@ pub fn fix_geometries(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
             }
             FixOutcome::Skipped(_) => {
                 skipped_count += 1;
-                out_ds.push_next(None, f.attrs.clone());
+                // Preserve empty geometry rather than converting to Null
+                out_ds.push_next(Some(g.clone()), f.attrs.clone());
             }
         }
     }
@@ -1287,10 +1310,11 @@ mod tests {
         assert_eq!(rec.status, ValidityStatus::Invalid);
         assert_eq!(rec.error_category, ValidityCategory::HoleOutsideShell);
 
-        let fix = fix_geometry(&hole_outside);
+        let (fix, stats) = fix_geometry_with_stats(&hole_outside);
         let FixOutcome::Repaired(repaired) = fix else { panic!("expected Repaired, got {fix:?}") };
         let rec2 = validate_geometry(Some(&repaired), 1, GeometryType::Polygon);
         assert_eq!(rec2.status, ValidityStatus::Valid);
+        assert_eq!(stats.dropped_holes, 1, "outside hole is dropped by make_valid and counted in FixStats");
     }
 
     #[test]
