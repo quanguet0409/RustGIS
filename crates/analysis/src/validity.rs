@@ -824,6 +824,11 @@ fn fix_line_with_stats(parts: &[Vec<Coord>]) -> (FixOutcome, FixStats) {
         return (FixOutcome::Failed("all line parts collapsed to degenerate (fewer than 2 points)".into()), stats);
     }
 
+    let clean_val = validate_line(&clean_parts, 0);
+    if !clean_val.valid {
+        return (FixOutcome::Failed(clean_val.error_reason), stats);
+    }
+
     if !modified && clean_parts.len() == parts.len() {
         (FixOutcome::Unchanged(Geometry::Line(parts.to_vec())), stats)
     } else {
@@ -1437,6 +1442,8 @@ mod tests {
         let rec_spike = validate_geometry(Some(&spike), 1, GeometryType::Polyline);
         assert_eq!(rec_spike.status, ValidityStatus::Invalid);
         assert_eq!(rec_spike.error_category, ValidityCategory::SelfIntersection);
+        let fix_spike = fix_geometry(&spike);
+        assert!(matches!(fix_spike, FixOutcome::Failed(_)), "spike cannot be repaired and must return Failed");
 
         // Self-touching loop [A, B, C, B, D] passes through B twice
         let loop_line = Geometry::Line(vec![vec![
@@ -1450,6 +1457,8 @@ mod tests {
         assert_eq!(rec_loop.status, ValidityStatus::Invalid);
         assert_eq!(rec_loop.error_category, ValidityCategory::SelfIntersection);
         assert_eq!(rec_loop.error_location, Some(Coord::new(2.0, 2.0)));
+        let fix_loop = fix_geometry(&loop_line);
+        assert!(matches!(fix_loop, FixOutcome::Failed(_)), "self-touching loop cannot be repaired and must return Failed");
 
         // Permitted closed loop [A, B, C, A]
         let closed_loop =
