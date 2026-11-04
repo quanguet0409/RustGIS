@@ -299,3 +299,28 @@ fn test_polyline_self_intersection_check_and_fix() {
     let Output::Layer(out) = fix_res.output else { panic!("expected layer") };
     assert_eq!(out.features[0].geometry, Some(line));
 }
+
+#[test]
+fn test_failed_repair_does_not_tally_dropped_stats() {
+    let mut l = create_layer("unrepairable_lossy_line", GeometryType::Polyline);
+    // Line part 0 has a NaN, part 1 has a self-intersection
+    let line = Geometry::Line(vec![
+        vec![Coord::new(0.0, 0.0), Coord::new(f64::NAN, 1.0), Coord::new(5.0, 5.0)],
+        vec![Coord::new(0.0, 0.0), Coord::new(2.0, 2.0), Coord::new(0.0, 2.0), Coord::new(2.0, 0.0)],
+    ]);
+    l.ds.push_next(Some(line), vec![Value::Text("fail_line".into()), Value::Int(1)]);
+
+    let res = rustgis_analysis::run("fixGeometries", &l, &json!({"input": "unrepairable_lossy_line"})).unwrap();
+    assert!(res.messages[0].contains("1 failed"));
+    // Because the repair failed and preserved the original geometry, NO dropped notices should be emitted!
+    let all_msgs = res.messages.join("\n");
+    assert!(!all_msgs.contains("dropped"), "expected no dropped notices for failed feature, got: {all_msgs}");
+}
+
+#[test]
+fn test_fix_geometries_rejects_standalone_table() {
+    let mut l = create_layer("table_input", GeometryType::None);
+    l.ds.push_next(None, vec![Value::Text("record".into()), Value::Int(1)]);
+    let err = rustgis_analysis::run("fixGeometries", &l, &json!({"input": "table_input"})).unwrap_err();
+    assert!(err.contains("has no geometry (standalone table)"));
+}

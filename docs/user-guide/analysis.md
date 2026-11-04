@@ -838,11 +838,13 @@ The **Check Geometry** (`checkGeometry`) and **Fix Geometries** (`fixGeometries`
 vector geometry validity issues according to the OGC Simple Features Specification (SFS).
 
 - **Check Geometry** inspects feature geometries in native coordinate space without projection distortion.
-  It detects self-intersections (e.g. bow-ties and crossing lines/loops), unclosed rings, rings with too few points (< 3 distinct vertices),
-  interior holes outside their exterior shells, overlapping or touching interior rings, overlapping MultiPolygon components,
-  and non-finite coordinates. It outputs a standalone validation report table (`<input>_Validation`) containing:
+  It detects self-intersections (transverse crossings between non-adjacent line segments or polygon edges), unclosed rings,
+  rings with too few points (< 3 distinct vertices), interior holes outside their exterior shells, overlapping or touching interior rings,
+  overlapping MultiPolygon components, and non-finite coordinates. It outputs a standalone validation report table (`<input>_Validation`) containing:
   `feature_id`, `geometry_type`, `status` (`Valid`, `Invalid`, `Empty`, `Null`, `Unsupported`, `Error`), `valid` (boolean),
-  `error_category`, `error_reason`, and problem coordinates (`error_x`, `error_y`) pinpointing the issue location.
+  `error_category`, `error_reason`, and problem coordinates (`error_x`, `error_y`) pinpointing the issue location (such as the segment
+  crossing or representative coordinate of the overlapping element). Line checks detect transverse crossings; tangent touches and collinear
+  overlaps without crossing are preserved.
 - **Fix Geometries** repairs invalid geometries automatically using constrained Delaunay triangulation
   ([Hugo Ledoux et al., 2014](http://dx.doi.org/10.1016/j.cageo.2014.01.009)). Already-valid features are preserved
   with 100% bitwise identical coordinates. During repair of invalid geometries, consecutive duplicate vertices are removed,

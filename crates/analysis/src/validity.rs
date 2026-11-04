@@ -136,10 +136,53 @@ fn ring_role_index(role: RingRole) -> usize {
 }
 
 fn find_rings_intersection(ring1: &[Coord], ring2: &[Coord]) -> Option<Coord> {
+    if ring1.is_empty() || ring2.is_empty() {
+        return ring2.first().copied().or_else(|| ring1.first().copied());
+    }
+
+    // Bounding box prefilter
+    let (mut min_x1, mut max_x1) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut min_y1, mut max_y1) = (f64::INFINITY, f64::NEG_INFINITY);
+    for c in ring1 {
+        min_x1 = min_x1.min(c.x);
+        max_x1 = max_x1.max(c.x);
+        min_y1 = min_y1.min(c.y);
+        max_y1 = max_y1.max(c.y);
+    }
+
+    let (mut min_x2, mut max_x2) = (f64::INFINITY, f64::NEG_INFINITY);
+    let (mut min_y2, mut max_y2) = (f64::INFINITY, f64::NEG_INFINITY);
+    for c in ring2 {
+        min_x2 = min_x2.min(c.x);
+        max_x2 = max_x2.max(c.x);
+        min_y2 = min_y2.min(c.y);
+        max_y2 = max_y2.max(c.y);
+    }
+
+    if min_x1 > max_x2 || min_x2 > max_x1 || min_y1 > max_y2 || min_y2 > max_y1 {
+        return ring2.first().copied().or_else(|| ring1.first().copied());
+    }
+
     let segs1: Vec<(Coord, Coord)> = ring1.windows(2).filter_map(|w| Some((*w.first()?, *w.get(1)?))).collect();
     let segs2: Vec<(Coord, Coord)> = ring2.windows(2).filter_map(|w| Some((*w.first()?, *w.get(1)?))).collect();
+
+    // Budget work to avoid quadratic stalls on hostile/dense rings
+    let mut work = 0usize;
+    const MAX_INTERSECTION_WORK: usize = 50_000;
+
     for a in &segs1 {
+        let (a_minx, a_maxx) = (a.0.x.min(a.1.x), a.0.x.max(a.1.x));
+        let (a_miny, a_maxy) = (a.0.y.min(a.1.y), a.0.y.max(a.1.y));
         for b in &segs2 {
+            work += 1;
+            if work > MAX_INTERSECTION_WORK {
+                return ring2.first().copied().or_else(|| ring1.first().copied());
+            }
+            let (b_minx, b_maxx) = (b.0.x.min(b.1.x), b.0.x.max(b.1.x));
+            let (b_miny, b_maxy) = (b.0.y.min(b.1.y), b.0.y.max(b.1.y));
+            if a_minx > b_maxx || b_minx > a_maxx || a_miny > b_maxy || b_miny > a_maxy {
+                continue;
+            }
             if let Some(c) = segments_cross(*a, *b) {
                 return Some(c);
             }
@@ -148,10 +191,12 @@ fn find_rings_intersection(ring1: &[Coord], ring2: &[Coord]) -> Option<Coord> {
     ring2.first().copied().or_else(|| ring1.first().copied())
 }
 
-/// Converts RustGIS polygon rings into a `geo::MultiPolygon<f64>` in native coordinates.
-fn to_geo_multipolygon(polys: &[Vec<Vec<Coord>>]) -> Option<geo::MultiPolygon<f64>> {
+/// Converts RustGIS polygon rings into a `geo::MultiPolygon<f64>` in native coordinates,
+/// along with a mapping of each geo polygon index to its original index in `polys`.
+fn to_geo_multipolygon(polys: &[Vec<Vec<Coord>>]) -> Option<(geo::MultiPolygon<f64>, Vec<usize>)> {
     let mut geo_polys = Vec::new();
-    for rings in polys {
+    let mut orig_indices = Vec::new();
+    for (orig_idx, rings) in polys.iter().enumerate() {
         let mut it = rings.iter();
         let Some(exterior_coords) = it.next() else { continue };
         if exterior_coords.is_empty() {
@@ -160,11 +205,12 @@ fn to_geo_multipolygon(polys: &[Vec<Vec<Coord>>]) -> Option<geo::MultiPolygon<f6
         let exterior = geo::LineString::new(exterior_coords.iter().copied().map(to_geo_coord).collect());
         let interiors = it.map(|hole| geo::LineString::new(hole.iter().copied().map(to_geo_coord).collect())).collect();
         geo_polys.push(geo::Polygon::new(exterior, interiors));
+        orig_indices.push(orig_idx);
     }
     if geo_polys.is_empty() {
         return None;
     }
-    Some(geo::MultiPolygon::new(geo_polys))
+    Some((geo::MultiPolygon::new(geo_polys), orig_indices))
 }
 
 /// Converts a `geo::MultiPolygon<f64>` back to RustGIS `Geometry::Polygon` in native coordinates.
@@ -441,7 +487,7 @@ fn validate_polygon(polys: &[Vec<Vec<Coord>>], feature_id: u64) -> ValidationRec
     }
 
     // Step 2: Use geo::Validation for containment and topological relationships
-    let Some(geo_mp) = to_geo_multipolygon(polys) else {
+    let Some((geo_mp, orig_indices)) = to_geo_multipolygon(polys) else {
         return ValidationRecord {
             feature_id,
             geometry_type: "Polygon",
@@ -454,7 +500,7 @@ fn validate_polygon(polys: &[Vec<Vec<Coord>>], feature_id: u64) -> ValidationRec
     };
 
     if let Err(err) = geo_mp.check_validation() {
-        return interpret_geo_multipolygon_error(err, polys, feature_id);
+        return interpret_geo_multipolygon_error(err, polys, &orig_indices, feature_id);
     }
 
     ValidationRecord {
@@ -468,10 +514,15 @@ fn validate_polygon(polys: &[Vec<Vec<Coord>>], feature_id: u64) -> ValidationRec
     }
 }
 
-fn interpret_geo_multipolygon_error(err: InvalidMultiPolygon, polys: &[Vec<Vec<Coord>>], feature_id: u64) -> ValidationRecord {
+fn interpret_geo_multipolygon_error(
+    err: InvalidMultiPolygon,
+    polys: &[Vec<Vec<Coord>>],
+    orig_indices: &[usize],
+    feature_id: u64,
+) -> ValidationRecord {
     match err {
         InvalidMultiPolygon::InvalidPolygon(geom_idx, poly_err) => {
-            let p_idx = geom_idx.0;
+            let p_idx = orig_indices.get(geom_idx.0).copied().unwrap_or(geom_idx.0);
             match poly_err {
                 InvalidPolygon::SelfIntersection(role) => {
                     let role_str = match role {
@@ -593,44 +644,48 @@ fn interpret_geo_multipolygon_error(err: InvalidMultiPolygon, polys: &[Vec<Vec<C
             }
         }
         InvalidMultiPolygon::ElementsOverlaps(idx1, idx2) => {
+            let p1_idx = orig_indices.get(idx1.0).copied().unwrap_or(idx1.0);
+            let p2_idx = orig_indices.get(idx2.0).copied().unwrap_or(idx2.0);
             let loc = polys
-                .get(idx1.0)
+                .get(p1_idx)
                 .and_then(|p1| {
-                    polys.get(idx2.0).and_then(|p2| {
+                    polys.get(p2_idx).and_then(|p2| {
                         let r1 = p1.first()?;
                         let r2 = p2.first()?;
                         find_rings_intersection(r1, r2)
                     })
                 })
-                .or_else(|| polys.get(idx2.0).and_then(|rings| rings.first()).and_then(|r| r.first().copied()));
+                .or_else(|| polys.get(p2_idx).and_then(|rings| rings.first()).and_then(|r| r.first().copied()));
             ValidationRecord {
                 feature_id,
                 geometry_type: "Polygon",
                 status: ValidityStatus::Invalid,
                 valid: false,
                 error_category: ValidityCategory::ComponentsOverlap,
-                error_reason: format!("polygons at indices {} and {} in MultiPolygon overlap on an area", idx1.0, idx2.0),
+                error_reason: format!("polygons at indices {} and {} in MultiPolygon overlap on an area", p1_idx, p2_idx),
                 error_location: loc,
             }
         }
         InvalidMultiPolygon::ElementsTouchOnALine(idx1, idx2) => {
+            let p1_idx = orig_indices.get(idx1.0).copied().unwrap_or(idx1.0);
+            let p2_idx = orig_indices.get(idx2.0).copied().unwrap_or(idx2.0);
             let loc = polys
-                .get(idx1.0)
+                .get(p1_idx)
                 .and_then(|p1| {
-                    polys.get(idx2.0).and_then(|p2| {
+                    polys.get(p2_idx).and_then(|p2| {
                         let r1 = p1.first()?;
                         let r2 = p2.first()?;
                         find_rings_intersection(r1, r2)
                     })
                 })
-                .or_else(|| polys.get(idx2.0).and_then(|rings| rings.first()).and_then(|r| r.first().copied()));
+                .or_else(|| polys.get(p2_idx).and_then(|rings| rings.first()).and_then(|r| r.first().copied()));
             ValidationRecord {
                 feature_id,
                 geometry_type: "Polygon",
                 status: ValidityStatus::Invalid,
                 valid: false,
                 error_category: ValidityCategory::ComponentsOverlap,
-                error_reason: format!("polygons at indices {} and {} in MultiPolygon touch along a line", idx1.0, idx2.0),
+                error_reason: format!("polygons at indices {} and {} in MultiPolygon touch along a line", p1_idx, p2_idx),
                 error_location: loc,
             }
         }
@@ -683,6 +738,12 @@ fn fix_line_with_stats(parts: &[Vec<Coord>]) -> (FixOutcome, FixStats) {
     let mut stats = FixStats::default();
     if parts.is_empty() || parts.iter().all(|p| p.is_empty()) {
         return (FixOutcome::Skipped("polyline has no vertices or parts"), stats);
+    }
+
+    // Fast path: if already valid, keep 100% bitwise coordinates intact.
+    let validation = validate_line(parts, 0);
+    if validation.valid {
+        return (FixOutcome::Unchanged(Geometry::Line(parts.to_vec())), stats);
     }
 
     let mut clean_parts: Vec<Vec<Coord>> = Vec::new();
@@ -999,23 +1060,6 @@ pub fn fix_geometries(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
 
         let (outcome, stats) = fix_geometry_with_stats(g);
 
-        if stats.dropped_non_finite > 0 {
-            total_dropped_non_finite += stats.dropped_non_finite;
-            features_with_dropped_non_finite += 1;
-        }
-        if stats.dropped_parts > 0 {
-            total_dropped_parts += stats.dropped_parts;
-            features_with_dropped_parts += 1;
-        }
-        if stats.dropped_holes > 0 {
-            total_dropped_holes += stats.dropped_holes;
-            features_with_dropped_holes += 1;
-        }
-        if stats.dropped_components > 0 {
-            total_dropped_components += stats.dropped_components;
-            features_with_dropped_components += 1;
-        }
-
         match outcome {
             FixOutcome::Unchanged(orig) => {
                 unchanged_count += 1;
@@ -1023,6 +1067,22 @@ pub fn fix_geometries(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
             }
             FixOutcome::Repaired(repaired) => {
                 repaired_count += 1;
+                if stats.dropped_non_finite > 0 {
+                    total_dropped_non_finite += stats.dropped_non_finite;
+                    features_with_dropped_non_finite += 1;
+                }
+                if stats.dropped_parts > 0 {
+                    total_dropped_parts += stats.dropped_parts;
+                    features_with_dropped_parts += 1;
+                }
+                if stats.dropped_holes > 0 {
+                    total_dropped_holes += stats.dropped_holes;
+                    features_with_dropped_holes += 1;
+                }
+                if stats.dropped_components > 0 {
+                    total_dropped_components += stats.dropped_components;
+                    features_with_dropped_components += 1;
+                }
                 out_ds.push_next(Some(repaired), f.attrs.clone());
             }
             FixOutcome::Failed(reason) => {
@@ -1314,5 +1374,30 @@ mod tests {
         let FixOutcome::Repaired(Geometry::Line(parts)) = fix else { panic!("expected Repaired") };
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].len(), 2);
+    }
+
+    #[test]
+    fn test_valid_polyline_with_duplicates_is_unchanged() {
+        // Valid polyline with consecutive duplicate points [A, A, B]
+        let line = Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(0.0, 0.0), Coord::new(5.0, 5.0)]]);
+        assert_eq!(validate_geometry(Some(&line), 1, GeometryType::Polyline).status, ValidityStatus::Valid);
+        let fix = fix_geometry(&line);
+        // Fast path keeps 100% bitwise coordinates intact as Unchanged
+        assert_eq!(fix, FixOutcome::Unchanged(line));
+    }
+
+    #[test]
+    fn test_empty_component_does_not_shift_multipolygon_error_indices() {
+        // MultiPolygon where component 0 is empty [], and components 1 & 2 overlap
+        let square1 =
+            vec![Coord::new(0.0, 0.0), Coord::new(10.0, 0.0), Coord::new(10.0, 10.0), Coord::new(0.0, 10.0), Coord::new(0.0, 0.0)];
+        let square2 =
+            vec![Coord::new(5.0, 5.0), Coord::new(15.0, 5.0), Coord::new(15.0, 15.0), Coord::new(5.0, 15.0), Coord::new(5.0, 5.0)];
+        let mp = Geometry::Polygon(vec![vec![], vec![square1], vec![square2]]);
+        let rec = validate_geometry(Some(&mp), 1, GeometryType::Polygon);
+        assert_eq!(rec.status, ValidityStatus::Invalid);
+        assert_eq!(rec.error_category, ValidityCategory::ComponentsOverlap);
+        // Error reason must report real original indices 1 and 2, not shifted indices 0 and 1!
+        assert!(rec.error_reason.contains("indices 1 and 2"), "got: {}", rec.error_reason);
     }
 }
