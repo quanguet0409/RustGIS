@@ -345,7 +345,7 @@ fn validate_line(parts: &[Vec<Coord>], feature_id: u64) -> ValidationRecord {
 }
 
 fn validate_polygon(polys: &[Vec<Vec<Coord>>], feature_id: u64) -> ValidationRecord {
-    if polys.is_empty() || polys.iter().all(|rings| rings.is_empty()) {
+    if polys.is_empty() || polys.iter().all(|rings| rings.iter().all(|ring| ring.is_empty())) {
         return ValidationRecord {
             feature_id,
             geometry_type: "Polygon",
@@ -764,7 +764,7 @@ fn clean_ring_coords(ring: &[Coord]) -> (Vec<Coord>, usize) {
 
 fn fix_polygon_with_stats(polys: &[Vec<Vec<Coord>>]) -> (FixOutcome, FixStats) {
     let mut stats = FixStats::default();
-    if polys.is_empty() || polys.iter().all(|rings| rings.is_empty()) {
+    if polys.is_empty() || polys.iter().all(|rings| rings.iter().all(|ring| ring.is_empty())) {
         return (FixOutcome::Skipped("polygon has no rings or coordinates"), stats);
     }
 
@@ -955,6 +955,9 @@ pub fn check_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
 /// The runner function for the `fixGeometries` geoprocessing tool.
 pub fn fix_geometries(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
+    if ds.geometry_type == GeometryType::None {
+        return Err(format!("layer '{}' has no geometry (standalone table)", ds.name));
+    }
     let target_rows = rows(inp, p, "input", ds);
 
     let output_name = out_name(p, format!("{}_Fixed", ds.name));
