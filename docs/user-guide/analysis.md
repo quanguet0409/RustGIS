@@ -838,7 +838,7 @@ The **Check Geometry** (`checkGeometry`) and **Fix Geometries** (`fixGeometries`
 vector geometry validity issues according to the OGC Simple Features Specification (SFS).
 
 - **Check Geometry** inspects feature geometries in native coordinate space without projection distortion.
-  It detects self-intersections (transverse crossings between non-adjacent line segments or polygon edges), unclosed rings,
+  It detects self-intersections (transverse crossings between non-adjacent line segments or polygon edges, and crossings between parts of multi-part polylines), unclosed rings,
   rings with too few points (< 3 distinct vertices), interior holes outside their exterior shells, overlapping or touching interior rings,
   overlapping MultiPolygon components, and non-finite coordinates. It outputs a standalone validation report table (`<input>_Validation`) containing:
   `feature_id`, `geometry_type`, `status` (`Valid`, `Invalid`, `Empty`, `Null`, `Unsupported`, `Error`), `valid` (boolean),

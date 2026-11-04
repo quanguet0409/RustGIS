@@ -344,3 +344,41 @@ fn test_fix_geometries_preserves_empty_geometry() {
     let Output::Layer(out) = res.output else { panic!("expected layer") };
     assert_eq!(out.features[0].geometry, Some(empty_poly));
 }
+
+#[test]
+fn test_multipart_polyline_crossing_check_and_fix() {
+    let mut l = create_layer("multipart_crossing", GeometryType::Polyline);
+    let part1 = vec![Coord::new(0.0, 0.0), Coord::new(10.0, 10.0)];
+    let part2 = vec![Coord::new(0.0, 10.0), Coord::new(10.0, 0.0)];
+    let ml = Geometry::Line(vec![part1, part2]);
+    l.ds.push_next(Some(ml.clone()), vec![Value::Text("cross".into()), Value::Int(1)]);
+
+    // Check Geometry detects cross-part crossing
+    let check_res = rustgis_analysis::run("checkGeometry", &l, &json!({"input": "multipart_crossing"})).unwrap();
+    let Output::Table(table) = check_res.output else { panic!("expected table") };
+    assert_eq!(table.features[0].attrs[2], Value::Text("Invalid".into()));
+    assert_eq!(table.features[0].attrs[4], Value::Text("Self-Intersection".into()));
+
+    // Fix Geometries returns Failed and preserves original geometry
+    let fix_res = rustgis_analysis::run("fixGeometries", &l, &json!({"input": "multipart_crossing"})).unwrap();
+    assert!(fix_res.messages[0].contains("1 failed"));
+    let Output::Layer(out) = fix_res.output else { panic!("expected layer") };
+    assert_eq!(out.features[0].geometry, Some(ml));
+}
+
+#[test]
+fn test_overlapping_squares_repair_notice() {
+    let mut l = create_layer("overlapping_squares", GeometryType::Polygon);
+    let square1 = vec![Coord::new(0.0, 0.0), Coord::new(10.0, 0.0), Coord::new(10.0, 10.0), Coord::new(0.0, 10.0), Coord::new(0.0, 0.0)];
+    let square2 = vec![Coord::new(2.0, 2.0), Coord::new(8.0, 2.0), Coord::new(8.0, 8.0), Coord::new(2.0, 8.0), Coord::new(2.0, 2.0)];
+    let mp = Geometry::Polygon(vec![vec![square1], vec![square2]]);
+    l.ds.push_next(Some(mp), vec![Value::Text("overlap".into()), Value::Int(1)]);
+
+    let res = rustgis_analysis::run("fixGeometries", &l, &json!({"input": "overlapping_squares"})).unwrap();
+    assert!(res.messages[0].contains("1 repaired"));
+    let all_msgs = res.messages.join("\n");
+    assert!(
+        all_msgs.contains("1 polygon component(s) merged or dropped by repair across 1 feature(s)."),
+        "expected merged or dropped notice, got: {all_msgs}"
+    );
+}

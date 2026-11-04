@@ -414,6 +414,109 @@ fn validate_line(parts: &[Vec<Coord>], feature_id: u64) -> ValidationRecord {
         }
     }
 
+    // Check for intersections between distinct parts of a multi-part polyline
+    if parts.len() > 1 {
+        let bboxes: Vec<(f64, f64, f64, f64)> = parts
+            .iter()
+            .map(|p| {
+                let (mut min_x, mut max_x) = (f64::INFINITY, f64::NEG_INFINITY);
+                let (mut min_y, mut max_y) = (f64::INFINITY, f64::NEG_INFINITY);
+                for c in p {
+                    min_x = min_x.min(c.x);
+                    max_x = max_x.max(c.x);
+                    min_y = min_y.min(c.y);
+                    max_y = max_y.max(c.y);
+                }
+                (min_x, max_x, min_y, max_y)
+            })
+            .collect();
+
+        let mut work = 0usize;
+        const MAX_INTERPART_WORK: usize = 50_000;
+
+        for i in 0..parts.len() {
+            let bbox_i = bboxes.get(i).copied().unwrap_or((0.0, 0.0, 0.0, 0.0));
+            let part_i = match parts.get(i) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            for j in (i + 1)..parts.len() {
+                let bbox_j = bboxes.get(j).copied().unwrap_or((0.0, 0.0, 0.0, 0.0));
+                // Bounding box prefilter
+                if bbox_i.0 > bbox_j.1 || bbox_j.0 > bbox_i.1 || bbox_i.2 > bbox_j.3 || bbox_j.2 > bbox_i.3 {
+                    continue;
+                }
+                let part_j = match parts.get(j) {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                // Check if an interior vertex of part_i is visited by part_j (or vice versa)
+                for (idx_i, ci) in part_i.iter().enumerate() {
+                    let is_interior_i = idx_i > 0 && idx_i < part_i.len().saturating_sub(1);
+                    for (idx_j, cj) in part_j.iter().enumerate() {
+                        let is_interior_j = idx_j > 0 && idx_j < part_j.len().saturating_sub(1);
+                        if (is_interior_i || is_interior_j) && ci == cj {
+                            return ValidationRecord {
+                                feature_id,
+                                geometry_type: "Polyline",
+                                status: ValidityStatus::Invalid,
+                                valid: false,
+                                error_category: ValidityCategory::SelfIntersection,
+                                error_reason: format!(
+                                    "Polyline parts {i} and {j} intersect at interior vertex ({:.6}, {:.6}) (non-simple)",
+                                    ci.x, ci.y
+                                ),
+                                error_location: Some(*ci),
+                            };
+                        }
+                    }
+                }
+
+                let segs_i: Vec<(Coord, Coord)> = part_i.windows(2).filter_map(|w| Some((*w.first()?, *w.get(1)?))).collect();
+                let segs_j: Vec<(Coord, Coord)> = part_j.windows(2).filter_map(|w| Some((*w.first()?, *w.get(1)?))).collect();
+
+                for a in &segs_i {
+                    let (a_minx, a_maxx) = (a.0.x.min(a.1.x), a.0.x.max(a.1.x));
+                    let (a_miny, a_maxy) = (a.0.y.min(a.1.y), a.0.y.max(a.1.y));
+                    for b in &segs_j {
+                        work += 1;
+                        if work > MAX_INTERPART_WORK {
+                            return ValidationRecord {
+                                feature_id,
+                                geometry_type: "Polyline",
+                                status: ValidityStatus::Error,
+                                valid: false,
+                                error_category: ValidityCategory::ProcessingError,
+                                error_reason: format!(
+                                    "Polyline parts {i} and {j}: work budget exceeded during cross-part intersection check"
+                                ),
+                                error_location: part_i.first().copied(),
+                            };
+                        }
+                        let (b_minx, b_maxx) = (b.0.x.min(b.1.x), b.0.x.max(b.1.x));
+                        let (b_miny, b_maxy) = (b.0.y.min(b.1.y), b.0.y.max(b.1.y));
+                        if a_minx > b_maxx || b_minx > a_maxx || a_miny > b_maxy || b_miny > a_maxy {
+                            continue;
+                        }
+                        if let Some(cross_loc) = segments_cross(*a, *b) {
+                            return ValidationRecord {
+                                feature_id,
+                                geometry_type: "Polyline",
+                                status: ValidityStatus::Invalid,
+                                valid: false,
+                                error_category: ValidityCategory::SelfIntersection,
+                                error_reason: format!("Polyline parts {i} and {j} cross at ({:.6}, {:.6})", cross_loc.x, cross_loc.y),
+                                error_location: Some(cross_loc),
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     ValidationRecord {
         feature_id,
         geometry_type: "Polyline",
@@ -1174,7 +1277,7 @@ pub fn fix_geometries(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     }
     if total_dropped_components > 0 {
         messages.push(format!(
-            "{total_dropped_components} degenerate polygon component(s) dropped across {features_with_dropped_components} feature(s)."
+            "{total_dropped_components} polygon component(s) merged or dropped by repair across {features_with_dropped_components} feature(s)."
         ));
     }
 
@@ -1396,6 +1499,19 @@ mod tests {
         let loc = rec.error_location.unwrap();
         assert!((loc.x - 1.0).abs() < 1e-4 && (loc.y - 1.0).abs() < 1e-4);
 
+        let fix = fix_geometry(&line);
+        assert!(matches!(fix, FixOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn test_multipart_polyline_cross_part_intersection() {
+        let part1 = vec![Coord::new(0.0, 0.0), Coord::new(10.0, 10.0)];
+        let part2 = vec![Coord::new(0.0, 10.0), Coord::new(10.0, 0.0)];
+        let line = Geometry::Line(vec![part1, part2]);
+        let rec = validate_geometry(Some(&line), 1, GeometryType::Polyline);
+        assert_eq!(rec.status, ValidityStatus::Invalid);
+        assert_eq!(rec.error_category, ValidityCategory::SelfIntersection);
+        assert!(rec.error_reason.contains("Polyline parts 0 and 1 cross"));
         let fix = fix_geometry(&line);
         assert!(matches!(fix, FixOutcome::Failed(_)));
     }
