@@ -842,7 +842,10 @@ pub(crate) fn touches_files(command: &str, params: &Value) -> bool {
         || ["import", "export", "open", "save", "add", "package", "upload", "download"].iter().any(|w| verb.starts_with(w))
         // Its inputs may be bare file names, which don't look like paths.
         || id == "raster.mosaic"
-        || ((id == "gp.run" || id == "gp.batch")
+        || (id == "gp.run"
+            && params.get("tool").and_then(Value::as_str).and_then(super::gp::tool_id)
+            .and_then(rustgis_analysis::tool).is_some_and(super::gp::writes_files))
+        || (id == "gp.batch"
             && params.get("tool").and_then(Value::as_str).and_then(super::gp::tool_id)
             .and_then(rustgis_analysis::tool).is_some_and(|t| super::gp::writes_files(t) || super::gp::reads_files(t) || super::gp::is_geolibre_tool(t)))
         || (id == "gp.batch"

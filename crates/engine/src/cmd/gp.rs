@@ -967,7 +967,6 @@ fn batch(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Runs a geoprocessing tool in batch across multiple layers or files with cancellation and progress reporting.
 pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustgis_analysis::control::Control>) -> CmdResult {
-    use rustgis_data::progress::Probe;
     let tool_name = ps(p, "tool").ok_or("tool is required")?;
     let tool_id = tool_id(tool_name).ok_or_else(|| format!("no tool '{tool_name}'"))?;
     let spec = rustgis_analysis::tool(tool_id).ok_or_else(|| format!("no tool '{tool_name}'"))?;
@@ -1092,6 +1091,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             Ok(entries) => {
                 let mut dir_entries = Vec::new();
                 let mut shp_stems = std::collections::HashSet::new();
+                let mut gpkg_stems = std::collections::HashSet::new();
                 for entry in entries {
                     match entry {
                         Ok(entry) => match entry.file_type() {
@@ -1106,6 +1106,10 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                                             && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
                                         {
                                             shp_stems.insert(stem.to_ascii_lowercase());
+                                        } else if ext == "gpkg"
+                                            && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+                                        {
+                                            gpkg_stems.insert(stem.to_ascii_lowercase());
                                         }
                                     }
                                     dir_entries.push((path, ft));
@@ -1127,10 +1131,14 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                             files.push(path.display().to_string());
                         } else {
                             let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("").to_ascii_lowercase();
-                            let is_shp_sidecar =
-                                matches!(ext.as_str(), "dbf" | "shx" | "prj" | "cpg" | "qpj" | "sbn" | "sbx" | "qix" | "xml")
-                                    && shp_stems.contains(&stem);
-                            let is_gpkg_sidecar = matches!(ext.as_str(), "gpkg-wal" | "gpkg-shm" | "wal" | "shm");
+                            let is_shp_sidecar = (matches!(ext.as_str(), "dbf" | "shx" | "prj" | "cpg" | "qpj" | "sbn" | "sbx" | "qix")
+                                && shp_stems.contains(&stem))
+                                || (ext == "xml"
+                                    && (shp_stems.contains(&stem)
+                                        || stem.strip_suffix(".shp").map(|s| shp_stems.contains(s)).unwrap_or(false)));
+                            let is_gpkg_sidecar = matches!(ext.as_str(), "gpkg-wal" | "gpkg-shm" | "wal" | "shm")
+                                && (gpkg_stems.contains(&stem)
+                                    || stem.strip_suffix(".gpkg").map(|s| gpkg_stems.contains(s)).unwrap_or(false));
                             if !is_shp_sidecar && !is_gpkg_sidecar {
                                 skipped += 1;
                             }
@@ -1170,8 +1178,6 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             "no inputs provided (specify 'inputs' as an array of layers/paths, '*' for all layers, or 'folder' as a directory path)".into(),
         );
     }
-
-    control.begin(targets.len() as u64);
 
     let mut succeeded = Vec::new();
     let mut failed = Vec::new();
@@ -1231,8 +1237,6 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     Err(e) => {
                         failed.push(json!({"input": target, "error": e.to_string()}));
                         s.active_layer = active_before;
-                        control.begin(targets.len() as u64);
-                        control.advance((i + 1) as u64);
                         continue;
                     }
                 }
@@ -1265,6 +1269,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         #[cfg(not(target_arch = "wasm32"))]
         let mut res_was_selected = false;
 
+        let prior_tables = s.project.tables.clone();
         match run_tool_quiet(s, tool_id, &item_params, control) {
             Ok((res, messages)) => {
                 succeeded.push(target.clone());
@@ -1311,16 +1316,21 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     }
                 } else if let Some(table) = res.get("table").and_then(Value::as_str) {
                     let mut final_table = table.to_string();
-                    if seen_outputs.contains(&final_table) {
-                        let stem = final_table.clone();
+                    let had_prior = prior_tables.into_iter().find(|t| t.name == table);
+                    if had_prior.is_some() || seen_outputs.contains(&final_table) {
+                        let stem = table.to_string();
                         let mut counter = 2;
-                        while seen_outputs.contains(&final_table) || crate::project::find_table(&s.project.tables, &final_table).is_some() {
-                            final_table = format!("{stem}_{counter}");
+                        final_table = format!("{stem}_{counter}");
+                        while seen_outputs.contains(&final_table) || s.project.tables.iter().any(|t| t.name == final_table) {
                             counter += 1;
+                            final_table = format!("{stem}_{counter}");
                         }
                         if let Some(t) = s.project.tables.iter_mut().find(|t| t.name == table) {
                             t.name.clone_from(&final_table);
                             t.dataset.name.clone_from(&final_table);
+                        }
+                        if let Some(prior_t) = had_prior {
+                            s.project.tables.push(prior_t);
                         }
                         collisions += 1;
                         if first_collision.is_none() {
@@ -1337,8 +1347,9 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 }
             }
             Err(err) => {
+                failed.push(json!({"input": target, "error": err}));
                 if control.is_cancelled() {
-                    cancelled_after = Some(i);
+                    cancelled_after = Some(i + 1);
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(temp_id) = temp_layer_id {
                         super::layer::drop_layers(s, &[temp_id]);
@@ -1346,7 +1357,6 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     s.active_layer = active_before;
                     break;
                 }
-                failed.push(json!({"input": target, "error": err}));
             }
         }
 
@@ -1358,9 +1368,6 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             }
         }
         s.active_layer = active_before;
-
-        control.begin(targets.len() as u64);
-        control.advance((i + 1) as u64);
     }
 
     if tool_messages.len() <= 3 {
@@ -2603,6 +2610,10 @@ mod file_permission_tests {
         assert!(!crate::cmd::items::touches_files("gp.batch", &p_wildcard));
         let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_wildcard));
         assert!(reaches.is_none());
+
+        // Plain gp.run of merge on project layers does not touch files.
+        let p_run_merge = json!({"tool": "merge", "params": {"inputs": ["Cities", "Parks"]}});
+        assert!(!crate::cmd::items::touches_files("gp.run", &p_run_merge));
     }
 }
 
@@ -2948,6 +2959,75 @@ mod batch_tests {
     }
 
     #[test]
+    fn batch_run_table_collision_with_existing_project_table() {
+        let mut s = Session::new(crate::Project::default());
+        let mut ds = Dataset::new(
+            "Cities",
+            rustgis_data::GeometryType::Point,
+            vec![rustgis_data::Field::new("pop", rustgis_data::FieldType::Integer)],
+        );
+        ds.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(10.0, 20.0))), vec![rustgis_data::Value::Int(100)]);
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, ds));
+
+        let existing = Dataset::new(
+            "Cities_Statistics",
+            rustgis_data::GeometryType::None,
+            vec![rustgis_data::Field::new("old", rustgis_data::FieldType::Integer)],
+        );
+        s.project.put_table(existing);
+
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "summaryStatistics",
+                    "inputs": ["Cities"],
+                    "params": {"field": "pop"}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let outputs = res["outputs"].as_array().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0], "Cities_Statistics_2");
+        assert!(crate::project::find_table(&s.project.tables, "Cities_Statistics").is_some());
+        assert!(crate::project::find_table(&s.project.tables, "Cities_Statistics_2").is_some());
+        assert!(s.notices.iter().any(|n| n.text.contains("output name(s) collided and were renamed")));
+    }
+
+    #[test]
+    fn batch_run_table_collision_duplicate_inputs() {
+        let mut s = Session::new(crate::Project::default());
+        let mut ds = Dataset::new(
+            "Cities",
+            rustgis_data::GeometryType::Point,
+            vec![rustgis_data::Field::new("pop", rustgis_data::FieldType::Integer)],
+        );
+        ds.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(10.0, 20.0))), vec![rustgis_data::Value::Int(100)]);
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, ds));
+
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "summaryStatistics",
+                    "inputs": ["Cities", "Cities"],
+                    "params": {"field": "pop"}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 2);
+        let outputs = res["outputs"].as_array().unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0], "Cities_Statistics");
+        assert_eq!(outputs[1], "Cities_Statistics_2");
+        assert!(crate::project::find_table(&s.project.tables, "Cities_Statistics").is_some());
+        assert!(crate::project::find_table(&s.project.tables, "Cities_Statistics_2").is_some());
+    }
+
+    #[test]
     fn batch_run_non_string_param_notified() {
         let mut s = test_session();
         let res = s
@@ -2966,7 +3046,7 @@ mod batch_tests {
     }
 
     #[test]
-    fn batch_run_macro_progress() {
+    fn batch_run_preserves_tool_progress() {
         let mut s = test_session();
         let control = rustgis_analysis::control::Control::new();
         let res = run_batch_with(
@@ -2982,7 +3062,8 @@ mod batch_tests {
 
         assert_eq!(res["total"], 2);
         assert_eq!(res["succeeded"], 2);
-        assert_eq!(control.progress(), Some((2, 2)));
+        // Progress reflects the last executed tool's completed features (Parks has 1 point feature)
+        assert_eq!(control.progress(), Some((1, 1)));
     }
 
     #[test]
@@ -3113,6 +3194,85 @@ mod batch_tests {
         assert_eq!(res["failed"], 0);
         assert_eq!(res["cancelled"], true);
         assert!(s.notices.iter().any(|n| n.text.contains("cancelled after 0 of 2")));
+    }
+
+    #[test]
+    fn batch_run_cancelled_failing_item_records_error() {
+        let mut s = test_session();
+        let control = rustgis_analysis::control::Control::new();
+        // Item fails during execution (nonexistent input layer):
+        let res = run_batch_with(
+            &mut s,
+            &json!({
+                "tool": "buffer",
+                "inputs": ["NonExistent"],
+                "params": {"distance": 10}
+            }),
+            &control,
+        )
+        .unwrap();
+
+        assert_eq!(res["total"], 1);
+        assert_eq!(res["failed"], 1);
+        let errors = res["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["input"], "NonExistent");
+    }
+
+    #[test]
+    fn batch_run_folder_skips_shp_xml_sidecar() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_shpxml_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let f1 = root.join("rivers.shp");
+        std::fs::write(&f1, b"").unwrap();
+        let f2 = root.join("rivers.shp.xml");
+        std::fs::write(&f2, b"<xml></xml>").unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let _ = s.run(
+            "gp.batch",
+            &json!({
+                "tool": "convexHull",
+                "folder": root.display().to_string(),
+            }),
+        );
+
+        assert!(!s.notices.iter().any(|n| n.text.contains("unsupported files skipped")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_folder_lone_wal_emits_notice() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_lonewal_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let valid = root.join("valid.geojson");
+        let sample_geojson = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1.0,2.0]},"properties":{}}]}"#;
+        std::fs::write(&valid, sample_geojson).unwrap();
+
+        let f = root.join("stray.wal");
+        std::fs::write(&f, b"stray wal content").unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let res = s.run(
+            "gp.batch",
+            &json!({
+                "tool": "convexHull",
+                "folder": root.display().to_string(),
+            }),
+        );
+        assert!(res.is_ok());
+        assert!(s.notices.iter().any(|n| n.text.contains("1 unsupported files skipped")));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
