@@ -1150,6 +1150,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     let mut seen_outputs = std::collections::HashSet::new();
     let mut collisions = 0;
     let mut first_collision = None;
+    #[allow(unused_mut)]
     let mut read_messages: Vec<String> = Vec::new();
     let mut tool_messages: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut cancelled_after = None;
@@ -1225,6 +1226,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             map.insert("output".to_string(), json!(final_out_name));
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
         let mut res_was_selected = false;
 
         match run_tool_quiet(s, tool_id, &item_params, control) {
@@ -1241,7 +1243,12 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 }
                 seen_outputs.insert(final_out_name.clone());
 
-                res_was_selected = res.get("selected").is_some();
+                let item_was_selected = res.get("selected").is_some();
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    res_was_selected = item_was_selected;
+                }
+
                 if let Some(lid) = res.get("layer").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()) {
                     layer_ids.push(lid);
                     let actual_name = s.map().layer(lid).map(|l| l.name.clone()).unwrap_or_else(|| final_out_name.clone());
@@ -1266,7 +1273,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                             }
                         }
                     }
-                } else if res_was_selected {
+                } else if item_was_selected {
                     seen_outputs.insert(target_layer_name.clone());
                     output_names.push(target_layer_name.clone());
                 } else {
