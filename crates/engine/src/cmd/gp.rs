@@ -1320,9 +1320,8 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 }
             }
             Err(err) => {
-                failed.push(json!({"input": target, "error": err}));
                 if control.is_cancelled() {
-                    cancelled_after = Some(i + 1);
+                    cancelled_after = Some(i);
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(temp_id) = temp_layer_id {
                         super::layer::drop_layers(s, &[temp_id]);
@@ -1330,6 +1329,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     s.active_layer = active_before;
                     break;
                 }
+                failed.push(json!({"input": target, "error": err}));
             }
         }
 
