@@ -377,12 +377,10 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
         if params.get("folder").is_some() {
             return Some(Reach::Files);
         }
-        if let Some(inputs) = params.get("inputs") {
-            let is_wildcard = inputs.as_str() == Some("*")
-                || inputs.as_array().is_some_and(|arr| arr.len() == 1 && arr.first().and_then(Value::as_str) == Some("*"));
-            if !is_wildcard {
-                return Some(Reach::Files);
-            }
+        if let Some(inputs) = params.get("inputs")
+            && !super::gp::is_wildcard_inputs(Some(inputs))
+        {
+            return Some(Reach::Files);
         }
         return None;
     }
