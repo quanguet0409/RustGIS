@@ -1196,6 +1196,8 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
 
     let mut succeeded = Vec::new();
     let mut failed = Vec::new();
+    let mut errors = Vec::new();
+    let mut interrupted_error = None;
     let mut layer_ids = Vec::new();
     let mut output_names = Vec::new();
     let mut seen_outputs = std::collections::HashSet::new();
@@ -1230,6 +1232,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     }
                     Err(e) => {
                         failed.push(json!({"input": target, "error": e.to_string()}));
+                        errors.push(json!({"input": target, "error": e.to_string()}));
                         s.active_layer = active_before;
                         continue;
                     }
@@ -1261,11 +1264,11 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         };
         let out_name = pattern.replace("{input}", base_name).replace("{tool}", tool_id);
         let mut final_out_name = out_name.clone();
-        let mut had_collision = false;
+        let mut had_collision = None;
         if tool_has_output {
             let collision_exists = |name: &str| {
                 seen_outputs.contains(name)
-                    || s.map().layer_by_name(name).is_some()
+                    || s.map().layer_by_name(name).map(|l| Some(l.id) != temp_layer_id).unwrap_or(false)
                     || crate::project::find_table(&s.project.tables, name).is_some()
             };
             if collision_exists(&final_out_name) {
@@ -1275,8 +1278,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     counter += 1;
                 }
                 final_out_name = format!("{stem}_{counter}");
-                next_suffix.insert(stem, counter + 1);
-                had_collision = true;
+                had_collision = Some((stem, counter + 1));
             }
         }
 
@@ -1302,6 +1304,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 "tool": tool_id,
                 "inputs": [target],
                 "params": base_params,
+                "param": batch_param,
             });
             if let Some(pat) = explicit_pattern {
                 record_json["outputPattern"] = json!(pat);
@@ -1324,12 +1327,6 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                         first_tool_message = item_msg.clone();
                     }
                 }
-                if had_collision {
-                    collisions += 1;
-                    if first_collision.is_none() {
-                        first_collision = Some(format!("'{out_name}' → '{final_out_name}'"));
-                    }
-                }
 
                 let item_was_selected = res.get("selected").is_some();
                 #[cfg(not(target_arch = "wasm32"))]
@@ -1340,6 +1337,18 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 let mut produced_output = false;
 
                 if let Some(lid) = res.get("layer").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()) {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(temp_id) = temp_layer_id.take() {
+                        super::layer::drop_layers(s, &[temp_id]);
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let should_rename = s.map().layer(lid).map(|l| l.name == format!("{final_out_name} (2)")).unwrap_or(false)
+                        && s.map().layer_by_name(&final_out_name).is_none();
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if should_rename && let Some(l) = s.map_mut().layer_mut(lid) {
+                        l.name = final_out_name.clone();
+                        l.dataset.name = final_out_name.clone();
+                    }
                     layer_ids.push(lid);
                     let actual_name = s.map().layer(lid).map(|l| l.name.clone()).unwrap_or_else(|| final_out_name.clone());
                     seen_outputs.insert(actual_name.clone());
@@ -1358,6 +1367,10 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     produced_output = true;
                 }
                 if let Some(lids) = res.get("layers").and_then(Value::as_array) {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(temp_id) = temp_layer_id.take() {
+                        super::layer::drop_layers(s, &[temp_id]);
+                    }
                     for l in lids {
                         if let Some(lid) = l.as_u64().and_then(|id| u32::try_from(id).ok()) {
                             layer_ids.push(lid);
@@ -1399,35 +1412,43 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                         }
                     }
                 }
-                if !produced_output {
-                    if item_was_selected {
-                        #[cfg(not(target_arch = "wasm32"))]
-                        if let Some(lid) = temp_layer_id {
-                            layer_ids.push(lid);
+                if produced_output {
+                    if let Some((stem, next_c)) = had_collision {
+                        collisions += 1;
+                        if first_collision.is_none() {
+                            first_collision = Some(format!("'{out_name}' → '{final_out_name}'"));
                         }
-                        seen_outputs.insert(target_layer_name.clone());
-                        output_names.push(target_layer_name.clone());
-                    } else {
-                        succeeded.pop();
-                        let err = item_msg.unwrap_or_else(|| "tool produced no output".into());
-                        if let Some(last) = s.project.gp_history.last_mut() {
-                            last.ok = false;
-                            if !last.messages.contains(&err) {
-                                last.messages.push(err.clone());
-                            }
+                        next_suffix.insert(stem, next_c);
+                    }
+                } else if item_was_selected {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(lid) = temp_layer_id {
+                        layer_ids.push(lid);
+                    }
+                    seen_outputs.insert(target_layer_name.clone());
+                    output_names.push(target_layer_name.clone());
+                } else {
+                    succeeded.pop();
+                    let err = item_msg.unwrap_or_else(|| "tool produced no output".into());
+                    if let Some(last) = s.project.gp_history.last_mut() {
+                        last.ok = false;
+                        if !last.messages.contains(&err) {
+                            last.messages.push(err.clone());
                         }
-                        failed.push(json!({"input": target, "error": err}));
-                        #[cfg(not(target_arch = "wasm32"))]
-                        if let Some(temp_id) = temp_layer_id.take() {
-                            super::layer::drop_layers(s, &[temp_id]);
-                        }
+                    }
+                    failed.push(json!({"input": target, "error": err.clone()}));
+                    errors.push(json!({"input": target, "error": err}));
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(temp_id) = temp_layer_id.take() {
+                        super::layer::drop_layers(s, &[temp_id]);
                     }
                 }
             }
             Err(err) => {
-                failed.push(json!({"input": target, "error": err}));
                 if control.is_cancelled() {
                     cancelled_after = Some(i + 1);
+                    interrupted_error = Some(err.clone());
+                    errors.push(json!({"input": target, "error": err, "interrupted": true}));
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(temp_id) = temp_layer_id.take() {
                         super::layer::drop_layers(s, &[temp_id]);
@@ -1435,6 +1456,8 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     s.active_layer = active_before;
                     break;
                 }
+                failed.push(json!({"input": target, "error": err.clone()}));
+                errors.push(json!({"input": target, "error": err}));
             }
         }
 
@@ -1482,11 +1505,15 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     let is_cancelled = cancelled_after.is_some();
     let num_ok = succeeded.len();
     let num_err = failed.len();
-    let attempted = num_ok + num_err;
+    let attempted = num_ok + num_err + if interrupted_error.is_some() { 1 } else { 0 };
     let total_count = if is_cancelled { attempted } else { targets.len() };
 
     let summary_msg = if is_cancelled {
-        format!("Batch '{tool_id}' cancelled after {attempted} of {}", targets.len())
+        if let Some(err) = &interrupted_error {
+            format!("Batch '{tool_id}' cancelled after {attempted} of {} ({err})", targets.len())
+        } else {
+            format!("Batch '{tool_id}' cancelled after {attempted} of {}", targets.len())
+        }
     } else if num_err == 0 {
         format!("Batch '{tool_id}' complete: all {num_ok} succeeded")
     } else {
@@ -1501,7 +1528,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         "failed": num_err,
         "layers": layer_ids,
         "outputs": output_names,
-        "errors": failed
+        "errors": errors
     });
     if is_cancelled {
         ret["cancelled"] = json!(true);
@@ -3226,7 +3253,7 @@ mod batch_tests {
 
     #[test]
     #[cfg(not(target_arch = "wasm32"))]
-    fn batch_run_file_input_pattern_collides_with_temp_layer() {
+    fn batch_run_file_input_pattern_no_false_collision_with_temp_layer() {
         let root = std::env::temp_dir().join(format!(
             "rustgis_batch_file_coll_{}",
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
@@ -3251,9 +3278,50 @@ mod batch_tests {
         assert_eq!(res["succeeded"], 1);
         let outputs = res["outputs"].as_array().unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0], "cities_2");
-        assert!(s.map().layer_by_name("cities_2").is_some());
-        assert!(s.notices.iter().any(|n| n.text.contains("output name(s) collided and were renamed")));
+        assert_eq!(outputs[0], "cities");
+        assert!(s.map().layer_by_name("cities").is_some());
+        assert!(!s.notices.iter().any(|n| n.text.contains("output name(s) collided and were renamed")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn batch_run_failed_item_does_not_bump_collision_suffix() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_fail_suffix_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let dir1 = root.join("d1");
+        let dir2 = root.join("d2");
+        std::fs::create_dir_all(&dir1).unwrap();
+        std::fs::create_dir_all(&dir2).unwrap();
+        let f1 = dir1.join("Cities.geojson");
+        let f2 = dir2.join("Cities.geojson");
+        std::fs::write(&f1, "bad json").unwrap();
+        std::fs::write(&f2, r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[10.0,20.0]},"properties":{}}]}"#).unwrap();
+
+        let mut s = test_session();
+        let pre = Dataset::new("Cities_buffer", rustgis_data::GeometryType::Point, Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(10, pre));
+
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": [f1.display().to_string(), f2.display().to_string()],
+                    "outputPattern": "{input}_{tool}",
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["failed"], 1);
+        assert_eq!(res["succeeded"], 1);
+        let outputs = res["outputs"].as_array().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0], "Cities_buffer_2");
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3513,7 +3581,7 @@ mod batch_tests {
     }
 
     #[test]
-    fn batch_run_cancel_during_item_records_failed_and_error() {
+    fn batch_run_cancel_during_item_records_interrupted_error() {
         let control = rustgis_analysis::control::Control::new();
         *CANCEL_CTL.lock().unwrap() = Some(control.clone());
         rustgis_analysis::register_external(
@@ -3554,13 +3622,14 @@ mod batch_tests {
 
         *CANCEL_CTL.lock().unwrap() = None;
 
-        assert_eq!(res["failed"], 1);
+        assert_eq!(res["failed"], 0);
         assert_eq!(res["succeeded"], 0);
         assert_eq!(res["cancelled"], true);
         assert_eq!(res["errors"].as_array().unwrap().len(), 1);
         assert_eq!(res["errors"][0]["error"], "Cancel Item Tool was cancelled");
-        assert!(s.notices.iter().any(|n| n.text.contains("1 failed (L1)")));
-        assert!(s.notices.iter().any(|n| n.text.contains("cancelled after 1 of 1")));
+        assert_eq!(res["errors"][0]["interrupted"], true);
+        assert!(!s.notices.iter().any(|n| n.text.contains("failed")));
+        assert!(s.notices.iter().any(|n| n.text.contains("cancelled after 1 of 1 (Cancel Item Tool was cancelled)")));
     }
 
     fn empty_output_runner(
@@ -3853,6 +3922,42 @@ mod batch_tests {
         assert_eq!(replay_cmd, "gp.batch");
         assert_eq!(replay_params["tool"], "selectByAttributes");
         assert_eq!(replay_params["inputs"][0], f1.display().to_string());
+        assert_eq!(replay_params["param"], "input");
+        let replay_res = s.run(&replay_cmd, &replay_params).unwrap();
+        assert_eq!(replay_res["succeeded"], 1);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_explicit_param_retained_in_history_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_exp_param_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let f1 = root.join("cities.geojson");
+        let sample_geojson = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1.0,2.0]},"properties":{"pop":100}}]}"#;
+        std::fs::write(&f1, sample_geojson).unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "selectByAttributes",
+                    "inputs": [f1.display().to_string()],
+                    "param": "input",
+                    "params": {"where": "pop > 50"}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let (replay_cmd, replay_params) = crate::cmd::history::replay(&s.project.gp_history[0]).unwrap();
+        assert_eq!(replay_cmd, "gp.batch");
+        assert_eq!(replay_params["param"], "input");
         let replay_res = s.run(&replay_cmd, &replay_params).unwrap();
         assert_eq!(replay_res["succeeded"], 1);
 
