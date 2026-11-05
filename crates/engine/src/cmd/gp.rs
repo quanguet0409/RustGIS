@@ -1196,33 +1196,6 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             break;
         }
 
-        let base_name = match s.map().layer_by_name(target) {
-            Some(layer) => layer.name.as_str(),
-            None if crate::project::find_table(&s.project.tables, target).is_some() => target.as_str(),
-            None => std::path::Path::new(target).file_stem().and_then(|stem| stem.to_str()).unwrap_or(target),
-        };
-        let tool_has_output = spec.params.iter().any(|param| param.name == "output");
-        let out_name = pattern.replace("{input}", base_name).replace("{tool}", tool_id);
-        let mut final_out_name = out_name.clone();
-        let mut had_collision = false;
-        if tool_has_output {
-            let collision_exists = |name: &str| {
-                seen_outputs.contains(name)
-                    || s.map().layer_by_name(name).is_some()
-                    || crate::project::find_table(&s.project.tables, name).is_some()
-            };
-            if collision_exists(&final_out_name) {
-                let stem = final_out_name.clone();
-                let mut counter = next_suffix.get(&stem).copied().unwrap_or(2);
-                while collision_exists(&format!("{stem}_{counter}")) {
-                    counter += 1;
-                }
-                final_out_name = format!("{stem}_{counter}");
-                next_suffix.insert(stem, counter + 1);
-                had_collision = true;
-            }
-        }
-
         let active_before = s.active_layer;
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -1262,6 +1235,33 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 target.to_string()
             }
         };
+
+        let base_name = match s.map().layer_by_name(target) {
+            Some(layer) => layer.name.as_str(),
+            None if crate::project::find_table(&s.project.tables, target).is_some() => target.as_str(),
+            None => std::path::Path::new(target).file_stem().and_then(|stem| stem.to_str()).unwrap_or(target),
+        };
+        let tool_has_output = spec.params.iter().any(|param| param.name == "output");
+        let out_name = pattern.replace("{input}", base_name).replace("{tool}", tool_id);
+        let mut final_out_name = out_name.clone();
+        let mut had_collision = false;
+        if tool_has_output {
+            let collision_exists = |name: &str| {
+                seen_outputs.contains(name)
+                    || s.map().layer_by_name(name).is_some()
+                    || crate::project::find_table(&s.project.tables, name).is_some()
+            };
+            if collision_exists(&final_out_name) {
+                let stem = final_out_name.clone();
+                let mut counter = next_suffix.get(&stem).copied().unwrap_or(2);
+                while collision_exists(&format!("{stem}_{counter}")) {
+                    counter += 1;
+                }
+                final_out_name = format!("{stem}_{counter}");
+                next_suffix.insert(stem, counter + 1);
+                had_collision = true;
+            }
+        }
 
         let mut item_params = base_params.clone();
         if let Value::Object(ref mut map) = item_params {
@@ -3148,6 +3148,39 @@ mod batch_tests {
             !s.notices.iter().any(|n| n.text.contains("output name(s) collided and were renamed")),
             "file-input summaryStatistics must not emit false collision notice"
         );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn batch_run_file_input_pattern_collides_with_temp_layer() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_file_coll_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("cities.geojson");
+        std::fs::write(&path, r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[10.0,20.0]},"properties":{}}]}"#).unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": [path.to_str().unwrap()],
+                    "outputPattern": "{input}",
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let outputs = res["outputs"].as_array().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0], "cities_2");
+        assert!(s.map().layer_by_name("cities_2").is_some());
+        assert!(s.notices.iter().any(|n| n.text.contains("output name(s) collided and were renamed")));
         let _ = std::fs::remove_dir_all(root);
     }
 
