@@ -357,16 +357,18 @@ pub fn user_only(id: &str) -> bool {
 pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     // External tools (the GeoLibre suite) run a native program that reads files a parameter
     // names, including bare file names.
-    if spec.id == "gp.run" && ps(params, "tool").and_then(rustgis_analysis::tool).is_some_and(super::gp::is_geolibre_tool) {
+    if (spec.id == "gp.run" || spec.id == "gp.batch")
+        && ps(params, "tool").and_then(rustgis_analysis::tool).is_some_and(super::gp::is_geolibre_tool)
+    {
         return Some(Reach::Files);
     }
     // So do tools with a file parameter (a plugin's `file`): they're handed the file.
-    if spec.id == "gp.run"
+    if (spec.id == "gp.run" || spec.id == "gp.batch")
         && ps(params, "tool").and_then(super::gp::tool_id).and_then(rustgis_analysis::tool).is_some_and(super::gp::reads_files)
     {
         return Some(Reach::Files);
     }
-    if spec.id == "gp.run"
+    if (spec.id == "gp.run" || spec.id == "gp.batch")
         && ps(params, "tool").and_then(super::gp::tool_id).and_then(rustgis_analysis::tool).is_some_and(super::gp::writes_files)
     {
         return Some(Reach::Files);

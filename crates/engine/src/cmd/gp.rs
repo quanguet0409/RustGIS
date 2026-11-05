@@ -12,7 +12,7 @@ pub fn commands() -> Vec<C> {
     vec![
         C::new("gp.run", "Run Tool", "Analyze › Geoprocessing", run).when(need_layers).params(r#"{"tool": tool id, "params": {...} (a layer by name; a standalone table by name or id)}"#),
         C::new("gp.batch", "Batch Run", "Analyze › Geoprocessing", batch).params(
-            r#"{"tool": tool id, "inputs"?: [layer names or file paths] | "*", "folder"?: folder path, "param"?: input parameter name (default "input"), "outputPattern"?: text (default "{input}_{tool}"), "params"?: {...}}"#,
+            r#"{"tool": tool id, "inputs"?: [layer names or file paths] | "*", "folder"?: folder path, "param"?: input parameter name (default: the tool's first layer parameter, else "input"), "batch_param"?: input parameter name, "outputPattern"?: text (default "{input}_{tool}"), "output_pattern"?: text, "params"?: {...}}"#,
         ),
         C::new("gp.spatialJoin", "Spatial Join", "Analyze › Overlay", spatial_join)
             .when(need_layers)
@@ -749,29 +749,12 @@ fn inputs_of<'a>(snap: Snapshot<'a>, spec: Option<&rustgis_analysis::ToolSpec>, 
     let mut full = full;
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(spec) = spec.filter(|t| rustgis_analysis::external_source(t).is_none()) {
-        for parameter in spec.params.iter() {
-            let names: Vec<String> = match parameter.kind {
-                rustgis_analysis::ParamKind::VectorLayers => {
-                    rustgis_analysis::layer_list(params.get(parameter.name).unwrap_or(&Value::Null))
-                        .unwrap_or_default()
-                        .into_iter()
-                        .map(String::from)
-                        .collect()
-                }
-                rustgis_analysis::ParamKind::Layer
-                | rustgis_analysis::ParamKind::PolygonLayer
-                | rustgis_analysis::ParamKind::PointLayer
-                | rustgis_analysis::ParamKind::VectorLayer => {
-                    params.get(parameter.name).and_then(Value::as_str).into_iter().map(String::from).collect()
-                }
-                _ => Vec::new(),
-            };
-            for name in names {
-                let path = std::path::Path::new(&name);
-                if snap.map.layer_by_name(&name).is_none() && !full.contains_key(&name) && path.is_file() {
-                    let (dataset, report) = rustgis_data::io::read_path(path).map_err(|e| format!("{name}: {e}"))?;
+        for parameter in spec.params.iter().filter(|p| p.kind == rustgis_analysis::ParamKind::VectorLayers) {
+            for name in rustgis_analysis::layer_list(params.get(parameter.name).unwrap_or(&Value::Null))? {
+                if snap.map.layer_by_name(name).is_none() && !full.contains_key(name) {
+                    let (dataset, report) = rustgis_data::io::read_path(std::path::Path::new(name)).map_err(|e| format!("{name}: {e}"))?;
                     messages.extend(report.messages.into_iter().map(|message| format!("{name}: {message}")));
-                    full.insert(name.clone(), dataset);
+                    full.insert(name.to_string(), dataset);
                 }
             }
         }
@@ -994,7 +977,18 @@ fn batch(s: &mut Session, p: &Value) -> CmdResult {
     });
 
     let pattern = ps(p, "outputPattern").or_else(|| ps(p, "output_pattern")).unwrap_or("{input}_{tool}");
+    if !pattern.contains("{input}") {
+        return Err("outputPattern must include '{input}' to avoid output name collisions".into());
+    }
+
     let base_params = p.get("params").filter(|v| v.is_object()).cloned().unwrap_or(json!({}));
+    if base_params.get("output").is_some() {
+        s.notify("params.output is ignored for batch runs; outputPattern determines output names", false);
+    }
+
+    if p.get("inputs").is_some() && p.get("folder").is_some() {
+        s.notify("both 'inputs' and 'folder' were provided; running 'inputs' and ignoring 'folder'", false);
+    }
 
     // Collect inputs: from "inputs" array, wildcard "*", or "folder" directory path.
     let mut targets: Vec<String> = Vec::new();
@@ -1027,20 +1021,40 @@ fn batch(s: &mut Session, p: &Value) -> CmdResult {
         if !dir.is_dir() {
             return Err(format!("folder '{folder}' does not exist or is not a directory"));
         }
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            let mut files = Vec::new();
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() {
-                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-                    if matches!(ext.as_str(), "shp" | "geojson" | "json" | "gpkg" | "fgb" | "parquet") {
-                        files.push(path.display().to_string());
+        let mut files = Vec::new();
+        let mut skipped = 0;
+        let mut unreadable = 0;
+        match std::fs::read_dir(dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => {
+                            let path = entry.path();
+                            if path.is_file() {
+                                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                                if matches!(ext.as_str(), "shp" | "geojson" | "json" | "gpkg" | "fgb" | "parquet") {
+                                    files.push(path.display().to_string());
+                                } else {
+                                    skipped += 1;
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            unreadable += 1;
+                        }
                     }
                 }
             }
-            files.sort();
-            targets.extend(files);
+            Err(e) => return Err(format!("folder '{folder}': {e}")),
         }
+        if skipped > 0 {
+            s.notify(format!("folder '{folder}': {skipped} unsupported files skipped"), false);
+        }
+        if unreadable > 0 {
+            s.notify(format!("folder '{folder}': {unreadable} unreadable directory entries skipped"), true);
+        }
+        files.sort();
+        targets.extend(files);
     }
 
     #[cfg(target_arch = "wasm32")]
@@ -1063,6 +1077,7 @@ fn batch(s: &mut Session, p: &Value) -> CmdResult {
     let mut failed = Vec::new();
     let mut layer_ids = Vec::new();
     let mut output_names = Vec::new();
+    let mut seen_outputs = std::collections::HashSet::new();
 
     for (i, target) in targets.iter().enumerate() {
         if control.is_cancelled() {
@@ -1070,19 +1085,66 @@ fn batch(s: &mut Session, p: &Value) -> CmdResult {
             break;
         }
 
-        let base_name = std::path::Path::new(target).file_stem().and_then(|stem| stem.to_str()).unwrap_or(target);
+        let base_name = match s.map().layer_by_name(target) {
+            Some(layer) => layer.name.as_str(),
+            None => std::path::Path::new(target).file_stem().and_then(|stem| stem.to_str()).unwrap_or(target),
+        };
         let out_name = pattern.replace("{input}", base_name).replace("{tool}", tool_id);
+        let mut final_out_name = out_name.clone();
+        if seen_outputs.contains(&final_out_name) || s.map().layer_by_name(&final_out_name).is_some() {
+            let stem = final_out_name.clone();
+            let mut counter = 2;
+            while seen_outputs.contains(&final_out_name) || s.map().layer_by_name(&final_out_name).is_some() {
+                final_out_name = format!("{stem}_{counter}");
+                counter += 1;
+            }
+            s.notify(format!("output name '{out_name}' collided; renamed to '{final_out_name}'"), false);
+        }
+        seen_outputs.insert(final_out_name.clone());
+
+        #[cfg(not(target_arch = "wasm32"))]
+        let temp_layer_id = {
+            let path = std::path::Path::new(target);
+            if s.map().layer_by_name(target).is_none() && crate::project::find_table(&s.project.tables, target).is_none() && path.is_file()
+            {
+                match rustgis_data::io::read_path(path) {
+                    Ok((dataset, _report)) => Some(super::layer::add_dataset(s, dataset)),
+                    Err(e) => {
+                        failed.push(json!({"input": target, "error": e.to_string()}));
+                        control.advance(1);
+                        continue;
+                    }
+                }
+            } else {
+                None
+            }
+        };
+
+        let target_layer_name = {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                if let Some(lid) = temp_layer_id {
+                    s.map().layer(lid).map(|l| l.name.clone()).unwrap_or_else(|| target.to_string())
+                } else {
+                    target.to_string()
+                }
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                target.to_string()
+            }
+        };
 
         let mut item_params = base_params.clone();
         if let Value::Object(ref mut map) = item_params {
-            map.insert(batch_param.to_string(), json!(target));
-            map.insert("output".to_string(), json!(out_name));
+            map.insert(batch_param.to_string(), json!(target_layer_name));
+            map.insert("output".to_string(), json!(final_out_name));
         }
 
         match run_tool_with(s, tool_id, &item_params, &control) {
             Ok(res) => {
                 succeeded.push(target.clone());
-                output_names.push(out_name);
+                output_names.push(final_out_name);
                 if let Some(lid) = res.get("layer").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()) {
                     layer_ids.push(lid);
                 } else if let Some(lids) = res.get("layers").and_then(Value::as_array) {
@@ -1094,11 +1156,22 @@ fn batch(s: &mut Session, p: &Value) -> CmdResult {
                 }
             }
             Err(err) => {
-                s.notify(format!("{target}: {err}"), true);
                 failed.push(json!({"input": target, "error": err}));
             }
         }
+
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(temp_id) = temp_layer_id {
+            s.map_mut().layers.retain(|l| l.id != temp_id);
+        }
+
         control.advance(1);
+    }
+
+    if !failed.is_empty() {
+        let sample = failed.iter().take(3).filter_map(|v| v.get("input").and_then(Value::as_str)).collect::<Vec<_>>().join(", ");
+        let more = if failed.len() > 3 { format!(" and {} more", failed.len() - 3) } else { String::new() };
+        s.notify(format!("Batch '{tool_id}': {} failed ({sample}{more})", failed.len()), true);
     }
 
     let total = targets.len();
@@ -2379,6 +2452,106 @@ mod batch_tests {
         assert_eq!(res["failed"], 0);
         assert!(s.map().layer_by_name("layer_a_hull").is_some());
         assert!(s.map().layer_by_name("layer_b_hull").is_some());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_dotted_layer_name() {
+        let mut s = Session::new(crate::Project::default());
+        let mut roads = Dataset::new("Roads.2020", rustgis_data::GeometryType::Point, Vec::new());
+        roads.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(1.0, 2.0))), Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, roads));
+
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Roads.2020"],
+                    "output_pattern": "{input}_buf",
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let outputs = res["outputs"].as_array().unwrap();
+        assert_eq!(outputs[0], "Roads.2020_buf");
+        assert!(s.map().layer_by_name("Roads.2020_buf").is_some());
+    }
+
+    #[test]
+    fn batch_run_output_collision_deduplication() {
+        let mut s = test_session();
+        let pre = Dataset::new("Cities_buffer", rustgis_data::GeometryType::Point, Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(10, pre));
+
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let outputs = res["outputs"].as_array().unwrap();
+        assert_eq!(outputs[0], "Cities_buffer_2");
+        assert!(s.map().layer_by_name("Cities_buffer_2").is_some());
+    }
+
+    #[test]
+    fn batch_run_output_pattern_must_include_input() {
+        let mut s = test_session();
+        let res = s.run(
+            "gp.batch",
+            &json!({
+                "tool": "buffer",
+                "inputs": ["Cities", "Parks"],
+                "outputPattern": "constant_output_name"
+            }),
+        );
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("must include '{input}'"));
+    }
+
+    #[test]
+    fn batch_run_folder_skips_unsupported_files() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_skip_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let f1 = root.join("layer.geojson");
+        let txt = root.join("readme.txt");
+        let doc = root.join("notes.pdf");
+        let sample_geojson = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1.0,2.0]},"properties":{}}]}"#;
+        std::fs::write(&f1, sample_geojson).unwrap();
+        std::fs::write(&txt, "text file").unwrap();
+        std::fs::write(&doc, "pdf file").unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "convexHull",
+                    "folder": root.display().to_string(),
+                    "output_pattern": "{input}_hull"
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["total"], 1);
+        assert_eq!(res["succeeded"], 1);
+        assert!(s.map().layer_by_name("layer_hull").is_some());
+
+        assert!(s.notices.iter().any(|n| n.text.contains("2 unsupported files skipped")));
 
         let _ = std::fs::remove_dir_all(root);
     }
