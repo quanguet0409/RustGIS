@@ -374,10 +374,10 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
         return Some(Reach::Files);
     }
     if spec.id == "gp.batch" {
-        if params.get("folder").is_some() {
+        if params.get("folder").is_some_and(|v| !v.is_null()) {
             return Some(Reach::Files);
         }
-        if let Some(inputs) = params.get("inputs")
+        if let Some(inputs) = params.get("inputs").filter(|v| !v.is_null())
             && !super::gp::is_wildcard_inputs(Some(inputs))
         {
             return Some(Reach::Files);

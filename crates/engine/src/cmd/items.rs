@@ -857,8 +857,8 @@ pub(crate) fn touches_files(command: &str, params: &Value) -> bool {
                 .and_then(rustgis_analysis::tool)
                 .is_some_and(|t| super::gp::writes_files(t) || super::gp::reads_files(t) || super::gp::is_geolibre_tool(t)))
         || (id == "gp.batch"
-            && (params.get("folder").is_some()
-                || (params.get("inputs").is_some() && !super::gp::is_wildcard_inputs(params.get("inputs")))))
+            && (params.get("folder").is_some_and(|v| !v.is_null())
+                || (params.get("inputs").is_some_and(|v| !v.is_null()) && !super::gp::is_wildcard_inputs(params.get("inputs")))))
         || reaches(params)
 }
 
@@ -911,7 +911,7 @@ pub(crate) fn looks_like_path(t: &str) -> bool {
 pub(crate) fn names_place(v: &Value, keys: &[&str], depth: usize) -> bool {
     match v {
         Value::Object(o) if depth < 16 => {
-            o.iter().any(|(k, v)| keys.contains(&k.to_ascii_lowercase().as_str()) || names_place(v, keys, depth + 1))
+            o.iter().any(|(k, v)| (!v.is_null() && keys.contains(&k.to_ascii_lowercase().as_str())) || names_place(v, keys, depth + 1))
         }
         Value::Array(a) if depth < 16 => a.iter().any(|v| names_place(v, keys, depth + 1)),
         Value::Object(_) | Value::Array(_) => true,

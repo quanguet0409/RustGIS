@@ -1036,10 +1036,10 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         }
         None => json!({}),
     };
-    if base_params.get("output").is_some() {
+    if base_params.get("output").is_some_and(|v| !v.is_null()) {
         s.notify("params.output is ignored for batch runs; outputPattern determines output names", false);
     }
-    if base_params.get(batch_param).is_some() {
+    if base_params.get(batch_param).is_some_and(|v| !v.is_null()) {
         s.notify(format!("gp.batch: 'params.{batch_param}' is replaced by the batch inputs"), false);
     }
 
@@ -1105,6 +1105,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         let mut skipped = 0;
         let mut subfolders = 0;
         let mut symlinks = 0;
+        let mut non_utf8 = 0;
         let mut unreadable = 0;
         match std::fs::read_dir(dir) {
             Ok(entries) => {
@@ -1119,6 +1120,10 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                                     symlinks += 1;
                                 } else {
                                     let path = entry.path();
+                                    if path.to_str().is_none() {
+                                        non_utf8 += 1;
+                                        continue;
+                                    }
                                     if ft.is_file() {
                                         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
                                         if ext == "shp"
@@ -1171,6 +1176,9 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         }
         if symlinks > 0 {
             s.notify(format!("folder '{folder}': {symlinks} symlink(s) skipped"), false);
+        }
+        if non_utf8 > 0 {
+            s.notify(format!("folder '{folder}': {non_utf8} file name(s) that are not valid UTF-8 skipped"), false);
         }
         if subfolders > 0 {
             s.notify(format!("folder '{folder}': {subfolders} subfolder(s) skipped"), false);
@@ -2799,6 +2807,12 @@ mod file_permission_tests {
         let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_wildcard));
         assert!(reaches.is_none());
 
+        // Null folder with wildcard inputs '*' does not touch files.
+        let p_null_folder_wildcard = json!({"tool": "convexHull", "inputs": "*", "folder": null});
+        assert!(!crate::cmd::items::touches_files("gp.batch", &p_null_folder_wildcard));
+        let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_null_folder_wildcard));
+        assert!(reaches.is_none());
+
         // Plain gp.run of merge on project layers does not touch files.
         let p_run_merge = json!({"tool": "merge", "params": {"inputs": ["Cities", "Parks"]}});
         assert!(!crate::cmd::items::touches_files("gp.run", &p_run_merge));
@@ -3113,6 +3127,43 @@ mod batch_tests {
         assert_eq!(res["total"], 1);
         assert_eq!(res["succeeded"], 1);
         assert!(s.notices.iter().any(|n| n.text.contains("1 subfolder(s) skipped")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn batch_run_folder_skips_non_utf8_filename() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_non_utf8_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let f1 = root.join("valid.geojson");
+        let sample_geojson = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1.0,2.0]},"properties":{}}]}"#;
+        std::fs::write(&f1, sample_geojson).unwrap();
+
+        let bad_name = std::ffi::OsStr::from_bytes(b"bad_\xff.geojson");
+        let bad_file = root.join(bad_name);
+        let _ = std::fs::write(&bad_file, sample_geojson);
+
+        let mut s = Session::new(crate::Project::default());
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "convexHull",
+                    "folder": root.display().to_string(),
+                    "output_pattern": "{input}_hull"
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["total"], 1);
+        assert_eq!(res["succeeded"], 1);
+        assert!(s.notices.iter().any(|n| n.text.contains("1 file name(s) that are not valid UTF-8 skipped")));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -4044,6 +4095,29 @@ mod batch_tests {
                 || n.text.contains("must be a string")
                 || n.text.contains("must be an array")),
             "null options must not emit spurious notices: {notices:?}"
+        );
+
+        let mark2 = s.notices.len();
+        let res2 = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "params": {
+                        "input": null,
+                        "output": null,
+                        "distance": 10
+                    }
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res2["succeeded"], 1);
+        let notices2 = &s.notices[mark2..];
+        assert!(
+            !notices2.iter().any(|n| n.text.contains("output is ignored") || n.text.contains("is replaced by the batch inputs")),
+            "null param fields must not emit spurious notices: {notices2:?}"
         );
     }
 
