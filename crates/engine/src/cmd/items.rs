@@ -780,6 +780,11 @@ pub(crate) fn touches_files(command: &str, params: &Value) -> bool {
         || ((id == "gp.run" || id == "gp.batch")
             && params.get("tool").and_then(Value::as_str).and_then(super::gp::tool_id)
             .and_then(rustgis_analysis::tool).is_some_and(super::gp::writes_files))
+        || (id == "gp.batch"
+            && (params.get("folder").is_some()
+                || params.get("inputs").is_some_and(|v| {
+                    v != "*" && !v.as_array().is_some_and(|arr| arr.len() == 1 && arr.first().and_then(Value::as_str) == Some("*"))
+                })))
         || reaches(params)
 }
 

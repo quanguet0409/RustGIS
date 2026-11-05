@@ -954,6 +954,13 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
 
 /// Runs a geoprocessing tool in batch across multiple layers or files.
 fn batch(s: &mut Session, p: &Value) -> CmdResult {
+    use rustgis_analysis::control::Control;
+    let control = if s.stoppable { Control::stoppable() } else { Control::new() };
+    run_batch_with(s, p, &control)
+}
+
+pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustgis_analysis::control::Control>) -> CmdResult {
+    use rustgis_data::progress::Probe;
     let tool_name = ps(p, "tool").ok_or("tool is required")?;
     let tool_id = tool_id(tool_name).ok_or_else(|| format!("no tool '{tool_name}'"))?;
     let spec = rustgis_analysis::tool(tool_id).ok_or_else(|| format!("no tool '{tool_name}'"))?;
@@ -976,12 +983,23 @@ fn batch(s: &mut Session, p: &Value) -> CmdResult {
             .unwrap_or("input")
     });
 
+    if !spec.params.iter().any(|param| param.name == batch_param) {
+        return Err(format!("tool '{tool_id}' has no parameter '{batch_param}'"));
+    }
+
     let pattern = ps(p, "outputPattern").or_else(|| ps(p, "output_pattern")).unwrap_or("{input}_{tool}");
     if !pattern.contains("{input}") {
         return Err("outputPattern must include '{input}' to avoid output name collisions".into());
     }
 
-    let base_params = p.get("params").filter(|v| v.is_object()).cloned().unwrap_or(json!({}));
+    let base_params = match p.get("params") {
+        Some(v) if v.is_object() => v.clone(),
+        Some(_) => {
+            s.notify("gp.batch: 'params' must be an object, ignoring invalid value", false);
+            json!({})
+        }
+        None => json!({}),
+    };
     if base_params.get("output").is_some() {
         s.notify("params.output is ignored for batch runs; outputPattern determines output names", false);
     }
@@ -990,8 +1008,9 @@ fn batch(s: &mut Session, p: &Value) -> CmdResult {
         s.notify("both 'inputs' and 'folder' were provided; running 'inputs' and ignoring 'folder'", false);
     }
 
-    // Collect inputs: from "inputs" array, wildcard "*", or "folder" directory path.
+    // Collect inputs: from "inputs" array or single string, wildcard "*", or "folder" directory path.
     let mut targets: Vec<String> = Vec::new();
+    let mut dropped_inputs = 0;
 
     let is_wildcard = p.get("inputs").and_then(Value::as_str).is_some_and(|s| s == "*")
         || p.get("inputs").and_then(Value::as_array).is_some_and(|arr| arr.len() == 1 && arr.first().and_then(Value::as_str) == Some("*"));
@@ -1008,9 +1027,26 @@ fn batch(s: &mut Session, p: &Value) -> CmdResult {
                 let trimmed = str_val.trim();
                 if !trimmed.is_empty() {
                     targets.push(trimmed.to_string());
+                } else {
+                    dropped_inputs += 1;
                 }
+            } else {
+                dropped_inputs += 1;
             }
         }
+    } else if let Some(single_str) = p.get("inputs").and_then(Value::as_str) {
+        let trimmed = single_str.trim();
+        if !trimmed.is_empty() {
+            targets.push(trimmed.to_string());
+        } else {
+            dropped_inputs += 1;
+        }
+    } else if p.get("inputs").is_some() {
+        s.notify("gp.batch: 'inputs' must be an array of layer names/paths or a single layer name", false);
+    }
+
+    if dropped_inputs > 0 {
+        s.notify(format!("gp.batch: {dropped_inputs} invalid input(s) skipped (not a valid layer name or file path)"), false);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1068,9 +1104,6 @@ fn batch(s: &mut Session, p: &Value) -> CmdResult {
         );
     }
 
-    use rustgis_analysis::control::Control;
-    use rustgis_data::progress::Probe;
-    let control = if s.stoppable { Control::stoppable() } else { Control::new() };
     control.begin(targets.len() as u64);
 
     let mut succeeded = Vec::new();
@@ -1141,7 +1174,13 @@ fn batch(s: &mut Session, p: &Value) -> CmdResult {
             map.insert("output".to_string(), json!(final_out_name));
         }
 
-        match run_tool_with(s, tool_id, &item_params, &control) {
+        let item_control =
+            if s.stoppable { rustgis_analysis::control::Control::stoppable() } else { rustgis_analysis::control::Control::new() };
+        if control.is_cancelled() {
+            item_control.cancel();
+        }
+
+        match run_tool_with(s, tool_id, &item_params, &item_control) {
             Ok(res) => {
                 succeeded.push(target.clone());
                 output_names.push(final_out_name);
@@ -2317,6 +2356,25 @@ mod file_permission_tests {
         };
         assert!(crate::model::output_ports(&node).is_empty(), "files must not be wired as layers");
     }
+
+    #[test]
+    fn batch_tool_with_inputs_or_folder_is_file_access() {
+        let s = Session::new(crate::Project::default());
+        let p_folder = json!({"tool": "convexHull", "folder": "data_dir"});
+        assert!(crate::cmd::items::touches_files("gp.batch", &p_folder));
+        let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_folder));
+        assert!(matches!(reaches, Some(crate::cmd::plugins::Reach::Files)));
+
+        let p_inputs = json!({"tool": "convexHull", "inputs": ["cities.gpkg"]});
+        assert!(crate::cmd::items::touches_files("gp.batch", &p_inputs));
+        let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_inputs));
+        assert!(matches!(reaches, Some(crate::cmd::plugins::Reach::Files)));
+
+        let p_wildcard = json!({"tool": "convexHull", "inputs": "*"});
+        assert!(!crate::cmd::items::touches_files("gp.batch", &p_wildcard));
+        let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_wildcard));
+        assert!(reaches.is_none());
+    }
 }
 
 #[cfg(test)]
@@ -2554,5 +2612,101 @@ mod batch_tests {
         assert!(s.notices.iter().any(|n| n.text.contains("2 unsupported files skipped")));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_macro_progress() {
+        let mut s = test_session();
+        let control = rustgis_analysis::control::Control::new();
+        let res = run_batch_with(
+            &mut s,
+            &json!({
+                "tool": "buffer",
+                "inputs": ["Cities", "Parks"],
+                "params": {"distance": 10}
+            }),
+            &control,
+        )
+        .unwrap();
+
+        assert_eq!(res["total"], 2);
+        assert_eq!(res["succeeded"], 2);
+        assert_eq!(control.progress(), Some((2, 2)));
+    }
+
+    #[test]
+    fn batch_run_invalid_param_rejected() {
+        let mut s = test_session();
+        let res = s.run(
+            "gp.batch",
+            &json!({
+                "tool": "buffer",
+                "inputs": ["Cities"],
+                "param": "imput",
+                "params": {"distance": 10}
+            }),
+        );
+        assert!(res.is_err());
+        assert!(res.unwrap_err().contains("tool 'buffer' has no parameter 'imput'"));
+    }
+
+    #[test]
+    fn batch_run_single_input_string() {
+        let mut s = test_session();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": "Cities",
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res["total"], 1);
+        assert_eq!(res["succeeded"], 1);
+        assert!(s.map().layer_by_name("Cities_buffer").is_some());
+    }
+
+    #[test]
+    fn batch_run_lossy_inputs_notified() {
+        let mut s = test_session();
+        let mark = s.notices.len();
+        // Lossy input: empty string and non-string in array, plus non-object params
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities", "", 42, "   "],
+                    "params": "not_an_object"
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["total"], 1);
+        assert_eq!(res["succeeded"], 1);
+        let notices = &s.notices[mark..];
+        assert!(notices.iter().any(|n| n.text.contains("3 invalid input(s) skipped")));
+        assert!(notices.iter().any(|n| n.text.contains("'params' must be an object")));
+
+        // Clean input says nothing
+        let mut s2 = test_session();
+        let mark2 = s2.notices.len();
+        let _ = s2
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+        let notices2 = &s2.notices[mark2..];
+        assert!(
+            !notices2.iter().any(|n| n.text.contains("skipped") || n.text.contains("invalid") || n.text.contains("params")),
+            "clean input must give no skip notices: {notices2:?}"
+        );
     }
 }

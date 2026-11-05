@@ -373,6 +373,19 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     {
         return Some(Reach::Files);
     }
+    if spec.id == "gp.batch" {
+        if params.get("folder").is_some() {
+            return Some(Reach::Files);
+        }
+        if let Some(inputs) = params.get("inputs") {
+            let is_wildcard = inputs.as_str() == Some("*")
+                || inputs.as_array().is_some_and(|arr| arr.len() == 1 && arr.first().and_then(Value::as_str) == Some("*"));
+            if !is_wildcard {
+                return Some(Reach::Files);
+            }
+        }
+        return None;
+    }
     // A catalog's Zarr entry is opened as `layer.addZarr` is, a database's way.
     if spec.id == "cube.open" && super::cube_catalog::opens_zarr(params) {
         return Some(Reach::Files);
