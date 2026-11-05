@@ -958,6 +958,21 @@ pub(crate) fn is_wildcard_inputs(v: Option<&Value>) -> bool {
         || v.and_then(Value::as_array).is_some_and(|arr| arr.len() == 1 && arr.first().and_then(Value::as_str) == Some("*"))
 }
 
+/// Whether batch parameters touch files (either the tool accesses files, or inputs/folder are file-based).
+pub(crate) fn batch_touches_files(params: &Value) -> bool {
+    let tool_touches = params
+        .get("tool")
+        .and_then(Value::as_str)
+        .and_then(tool_id)
+        .and_then(rustgis_analysis::tool)
+        .is_some_and(|t| writes_files(t) || reads_files(t) || is_geolibre_tool(t));
+
+    let folder_or_inputs = params.get("folder").is_some_and(|v| !v.is_null())
+        || (params.get("inputs").is_some_and(|v| !v.is_null()) && !is_wildcard_inputs(params.get("inputs")));
+
+    tool_touches || folder_or_inputs
+}
+
 /// Runs a geoprocessing tool in batch across multiple layers or files.
 fn batch(s: &mut Session, p: &Value) -> CmdResult {
     use rustgis_analysis::control::Control;
@@ -1051,15 +1066,21 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
 
     if is_wildcard {
         let mut skipped_rasters = 0;
+        let mut skipped_graphics = 0;
         for layer in &s.map().layers {
-            if !layer.is_raster() {
-                targets.push(layer.name.clone());
-            } else {
+            if layer.is_raster() {
                 skipped_rasters += 1;
+            } else if layer.graphics {
+                skipped_graphics += 1;
+            } else {
+                targets.push(layer.name.clone());
             }
         }
         if skipped_rasters > 0 {
             s.notify(format!("gp.batch: {skipped_rasters} raster layer(s) left out of '*' (it runs vector layers)"), false);
+        }
+        if skipped_graphics > 0 {
+            s.notify(format!("gp.batch: {skipped_graphics} graphics layer(s) left out of '*' (it runs vector layers)"), false);
         }
     } else if let Some(arr) = p.get("inputs").and_then(Value::as_array) {
         for item in arr {
@@ -2854,11 +2875,17 @@ mod file_permission_tests {
         let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_null_folder_wildcard));
         assert!(reaches.is_none());
 
-        // Wildcard batch with params.output is ignored by gp.batch and does not touch files.
+        // Wildcard batch with params.output is ignored by gp.batch and does not touch files for built-in tools.
         let p_wildcard_output = json!({"tool": "convexHull", "inputs": "*", "params": {"output": "Roads"}});
         assert!(!crate::cmd::items::touches_files("gp.batch", &p_wildcard_output));
         let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_wildcard_output));
         assert!(reaches.is_none());
+
+        // For a tool that is not built-in, or if params.output points to a file, wildcard batch touches files.
+        let p_wildcard_non_builtin = json!({"tool": "nonExistentExternalTool", "inputs": "*", "params": {"output": "some_file.shp"}});
+        assert!(crate::cmd::items::touches_files("gp.batch", &p_wildcard_non_builtin));
+        let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_wildcard_non_builtin));
+        assert!(matches!(reaches, Some(crate::cmd::plugins::Reach::Files)));
 
         // Plain gp.run of merge on project layers does not touch files.
         let p_run_merge = json!({"tool": "merge", "params": {"inputs": ["Cities", "Parks"]}});
@@ -4748,5 +4775,55 @@ mod batch_tests {
         assert!(notices.iter().any(|n| n.text.contains("trimmed surrounding whitespace from file path")));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_wildcard_skips_graphics_with_notice() {
+        let mut s = Session::new(crate::Project::default());
+        let mut ds_vec = Dataset::new("Rivers", rustgis_data::GeometryType::Point, Vec::new());
+        ds_vec.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(10.0, 20.0))), Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, ds_vec));
+
+        let mut ds_notes = Dataset::new("Notes", rustgis_data::GeometryType::Point, Vec::new());
+        ds_notes.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(5.0, 5.0))), Vec::new());
+        let mut notes_layer = rustgis_map::Layer::new(1, ds_notes);
+        notes_layer.graphics = true;
+        s.map_mut().add_layer(notes_layer);
+
+        let mark = s.notices.len();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": "*",
+                    "params": {"distance": 5}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let outputs = res["outputs"].as_array().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0], "Rivers_buffer");
+        let notices = &s.notices[mark..];
+        assert!(notices.iter().any(|n| n.text.contains("1 graphics layer(s) left out of '*'")));
+
+        let mut s_empty = Session::new(crate::Project::default());
+        let ds_only_notes = Dataset::new("Notes", rustgis_data::GeometryType::Point, Vec::new());
+        let mut notes_only_layer = rustgis_map::Layer::new(0, ds_only_notes);
+        notes_only_layer.graphics = true;
+        s_empty.map_mut().add_layer(notes_only_layer);
+        let err = s_empty
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": "*",
+                    "params": {"distance": 5}
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(err, "'*' matched no vector layers on the active map; add a vector layer or name the inputs");
     }
 }

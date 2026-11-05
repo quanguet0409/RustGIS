@@ -368,18 +368,13 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     {
         return Some(Reach::Files);
     }
-    if (spec.id == "gp.run" || spec.id == "gp.batch")
+    if spec.id == "gp.run"
         && ps(params, "tool").and_then(super::gp::tool_id).and_then(rustgis_analysis::tool).is_some_and(super::gp::writes_files)
     {
         return Some(Reach::Files);
     }
     if spec.id == "gp.batch" {
-        if params.get("folder").is_some_and(|v| !v.is_null()) {
-            return Some(Reach::Files);
-        }
-        if let Some(inputs) = params.get("inputs").filter(|v| !v.is_null())
-            && !super::gp::is_wildcard_inputs(Some(inputs))
-        {
+        if super::gp::batch_touches_files(params) {
             return Some(Reach::Files);
         }
         let stripped = super::items::layer_name_left_out(spec.id, params);

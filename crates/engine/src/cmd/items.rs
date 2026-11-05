@@ -849,16 +849,7 @@ pub(crate) fn touches_files(command: &str, params: &Value) -> bool {
                 .and_then(super::gp::tool_id)
                 .and_then(rustgis_analysis::tool)
                 .is_some_and(super::gp::writes_files))
-        || (id == "gp.batch"
-            && params
-                .get("tool")
-                .and_then(Value::as_str)
-                .and_then(super::gp::tool_id)
-                .and_then(rustgis_analysis::tool)
-                .is_some_and(|t| super::gp::writes_files(t) || super::gp::reads_files(t) || super::gp::is_geolibre_tool(t)))
-        || (id == "gp.batch"
-            && (params.get("folder").is_some_and(|v| !v.is_null())
-                || (params.get("inputs").is_some_and(|v| !v.is_null()) && !super::gp::is_wildcard_inputs(params.get("inputs")))))
+        || (id == "gp.batch" && super::gp::batch_touches_files(params))
         || reaches(params)
 }
 
@@ -886,7 +877,8 @@ pub(crate) fn layer_name_left_out<'a>(command: &str, params: &'a Value) -> std::
     if command == "gp.batch" {
         let mut out = params.clone();
         let mut modified = false;
-        if let Some(p) = out.get_mut("params").and_then(Value::as_object_mut)
+        if built_in()
+            && let Some(p) = out.get_mut("params").and_then(Value::as_object_mut)
             && p.remove("output").is_some()
         {
             modified = true;
