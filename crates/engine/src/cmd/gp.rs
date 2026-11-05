@@ -1128,8 +1128,10 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                         } else {
                             let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("").to_ascii_lowercase();
                             let is_shp_sidecar =
-                                matches!(ext.as_str(), "dbf" | "shx" | "prj" | "cpg" | "qpj" | "sbn" | "sbx") && shp_stems.contains(&stem);
-                            if !is_shp_sidecar {
+                                matches!(ext.as_str(), "dbf" | "shx" | "prj" | "cpg" | "qpj" | "sbn" | "sbx" | "qix" | "xml")
+                                    && shp_stems.contains(&stem);
+                            let is_gpkg_sidecar = matches!(ext.as_str(), "gpkg-wal" | "gpkg-shm" | "wal" | "shm");
+                            if !is_shp_sidecar && !is_gpkg_sidecar {
                                 skipped += 1;
                             }
                         }
@@ -1182,8 +1184,6 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     let mut read_messages: Vec<String> = Vec::new();
     let mut tool_messages: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut cancelled_after = None;
-
-    control.begin(targets.len() as u64);
 
     for (i, target) in targets.iter().enumerate() {
         if control.is_cancelled() {
@@ -1310,8 +1310,25 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                         }
                     }
                 } else if let Some(table) = res.get("table").and_then(Value::as_str) {
-                    seen_outputs.insert(table.to_string());
-                    output_names.push(table.to_string());
+                    let mut final_table = table.to_string();
+                    if seen_outputs.contains(&final_table) {
+                        let stem = final_table.clone();
+                        let mut counter = 2;
+                        while seen_outputs.contains(&final_table) || crate::project::find_table(&s.project.tables, &final_table).is_some() {
+                            final_table = format!("{stem}_{counter}");
+                            counter += 1;
+                        }
+                        if let Some(t) = s.project.tables.iter_mut().find(|t| t.name == table) {
+                            t.name.clone_from(&final_table);
+                            t.dataset.name.clone_from(&final_table);
+                        }
+                        collisions += 1;
+                        if first_collision.is_none() {
+                            first_collision = Some(format!("'{table}' → '{final_table}'"));
+                        }
+                    }
+                    seen_outputs.insert(final_table.clone());
+                    output_names.push(final_table);
                 } else if item_was_selected {
                     seen_outputs.insert(target_layer_name.clone());
                     output_names.push(target_layer_name.clone());
@@ -1346,8 +1363,17 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         control.advance((i + 1) as u64);
     }
 
-    for (msg, count) in tool_messages {
-        s.notify(format!("gp.batch: {count} item(s) reported: {msg}"), false);
+    if tool_messages.len() <= 3 {
+        for (msg, count) in &tool_messages {
+            s.notify(format!("gp.batch: {count} item(s) reported: {msg}"), false);
+        }
+    } else {
+        let total_reported: usize = tool_messages.values().sum();
+        let sample = tool_messages.keys().take(2).cloned().collect::<Vec<_>>().join("; ");
+        s.notify(
+            format!("gp.batch: {total_reported} message(s) reported across items (e.g. {sample}; and {} more)", tool_messages.len() - 2),
+            false,
+        );
     }
 
     if collisions > 0 {
