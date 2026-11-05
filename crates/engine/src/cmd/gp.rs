@@ -971,13 +971,15 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     let tool_id = tool_id(tool_name).ok_or_else(|| format!("no tool '{tool_name}'"))?;
     let spec = rustgis_analysis::tool(tool_id).ok_or_else(|| format!("no tool '{tool_name}'"))?;
 
-    if p.get("param").is_some_and(|v| !v.is_string()) {
+    if p.get("param").is_some_and(|v| !v.is_null() && !v.is_string()) {
         s.notify("gp.batch: 'param' must be a string, ignoring invalid value", false);
     }
-    if p.get("batch_param").is_some_and(|v| !v.is_string()) {
+    if p.get("batch_param").is_some_and(|v| !v.is_null() && !v.is_string()) {
         s.notify("gp.batch: 'batch_param' must be a string, ignoring invalid value", false);
     }
-    if p.get("outputPattern").is_some_and(|v| !v.is_string()) || p.get("output_pattern").is_some_and(|v| !v.is_string()) {
+    if p.get("outputPattern").is_some_and(|v| !v.is_null() && !v.is_string())
+        || p.get("output_pattern").is_some_and(|v| !v.is_null() && !v.is_string())
+    {
         s.notify("gp.batch: 'outputPattern' must be a string, ignoring invalid value", false);
     }
 
@@ -1026,7 +1028,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     }
     let tool_has_output = spec.params.iter().any(|param| param.name == "output");
 
-    let base_params = match p.get("params") {
+    let base_params = match p.get("params").filter(|v| !v.is_null()) {
         Some(v) if v.is_object() => v.clone(),
         Some(_) => {
             s.notify("gp.batch: 'params' must be an object, ignoring invalid value", false);
@@ -1079,7 +1081,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         } else {
             dropped_inputs += 1;
         }
-    } else if p.get("inputs").is_some() {
+    } else if p.get("inputs").is_some_and(|v| !v.is_null()) {
         s.notify("gp.batch: 'inputs' must be an array of layer names/paths or a single layer name", false);
     }
 
@@ -1087,7 +1089,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         s.notify(format!("gp.batch: {dropped_inputs} invalid input(s) skipped (not a valid layer name or file path)"), false);
     }
 
-    if p.get("folder").is_some() && !targets.is_empty() {
+    if p.get("folder").is_some_and(|v| !v.is_null()) && !targets.is_empty() {
         s.notify("both 'inputs' and 'folder' were provided; running 'inputs' and ignoring 'folder'", false);
     }
 
@@ -4014,6 +4016,35 @@ mod batch_tests {
         let recent: Vec<_> = s.notices[mark..].iter().filter(|n| n.text.contains("reported messages")).collect();
         assert_eq!(recent.len(), 1, "must emit exactly one tool messages notice: {recent:?}");
         assert_eq!(recent[0].text, "gp.batch: 2 item(s) reported messages (first: Buffer: 1 features at 10 Kilometers)");
+    }
+
+    #[test]
+    fn batch_run_null_options_emit_no_spurious_notices() {
+        let mut s = test_session();
+        let mark = s.notices.len();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "params": null,
+                    "folder": null,
+                    "param": null,
+                    "outputPattern": null
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let notices = &s.notices[mark..];
+        assert!(
+            !notices.iter().any(|n| n.text.contains("must be an object")
+                || n.text.contains("both 'inputs' and 'folder'")
+                || n.text.contains("must be a string")
+                || n.text.contains("must be an array")),
+            "null options must not emit spurious notices: {notices:?}"
+        );
     }
 
     #[test]
