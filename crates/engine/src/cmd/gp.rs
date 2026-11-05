@@ -11,6 +11,9 @@ use crate::{CmdResult, CommandSpec as C, GpRecord, Session};
 pub fn commands() -> Vec<C> {
     vec![
         C::new("gp.run", "Run Tool", "Analyze › Geoprocessing", run).when(need_layers).params(r#"{"tool": tool id, "params": {...} (a layer by name; a standalone table by name or id)}"#),
+        C::new("gp.batch", "Batch Run", "Analyze › Geoprocessing", batch).params(
+            r#"{"tool": tool id, "inputs"?: [layer names or file paths] | "*", "folder"?: folder path, "param"?: input parameter name (default "input"), "outputPattern"?: text (default "{input}_{tool}"), "params"?: {...}}"#,
+        ),
         C::new("gp.spatialJoin", "Spatial Join", "Analyze › Overlay", spatial_join)
             .when(need_layers)
             .params(
@@ -746,12 +749,29 @@ fn inputs_of<'a>(snap: Snapshot<'a>, spec: Option<&rustgis_analysis::ToolSpec>, 
     let mut full = full;
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(spec) = spec.filter(|t| rustgis_analysis::external_source(t).is_none()) {
-        for parameter in spec.params.iter().filter(|p| p.kind == rustgis_analysis::ParamKind::VectorLayers) {
-            for name in rustgis_analysis::layer_list(params.get(parameter.name).unwrap_or(&Value::Null))? {
-                if snap.map.layer_by_name(name).is_none() && !full.contains_key(name) {
-                    let (dataset, report) = rustgis_data::io::read_path(std::path::Path::new(name)).map_err(|e| format!("{name}: {e}"))?;
+        for parameter in spec.params.iter() {
+            let names: Vec<String> = match parameter.kind {
+                rustgis_analysis::ParamKind::VectorLayers => {
+                    rustgis_analysis::layer_list(params.get(parameter.name).unwrap_or(&Value::Null))
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(String::from)
+                        .collect()
+                }
+                rustgis_analysis::ParamKind::Layer
+                | rustgis_analysis::ParamKind::PolygonLayer
+                | rustgis_analysis::ParamKind::PointLayer
+                | rustgis_analysis::ParamKind::VectorLayer => {
+                    params.get(parameter.name).and_then(Value::as_str).into_iter().map(String::from).collect()
+                }
+                _ => Vec::new(),
+            };
+            for name in names {
+                let path = std::path::Path::new(&name);
+                if snap.map.layer_by_name(&name).is_none() && !full.contains_key(&name) && path.is_file() {
+                    let (dataset, report) = rustgis_data::io::read_path(path).map_err(|e| format!("{name}: {e}"))?;
                     messages.extend(report.messages.into_iter().map(|message| format!("{name}: {message}")));
-                    full.insert(name.to_string(), dataset);
+                    full.insert(name.clone(), dataset);
                 }
             }
         }
@@ -947,6 +967,159 @@ fn run(s: &mut Session, p: &Value) -> CmdResult {
     let tool = ps(p, "tool").ok_or("tool is required")?.to_string();
     let params = p.get("params").cloned().unwrap_or(json!({}));
     run_tool(s, &tool, &params)
+}
+
+/// Runs a geoprocessing tool in batch across multiple layers or files.
+fn batch(s: &mut Session, p: &Value) -> CmdResult {
+    let tool_name = ps(p, "tool").ok_or("tool is required")?;
+    let tool_id = tool_id(tool_name).ok_or_else(|| format!("no tool '{tool_name}'"))?;
+    let spec = rustgis_analysis::tool(tool_id).ok_or_else(|| format!("no tool '{tool_name}'"))?;
+
+    // Identify which parameter to bind the input to.
+    let batch_param = ps(p, "param").or_else(|| ps(p, "batch_param")).unwrap_or_else(|| {
+        spec.params
+            .iter()
+            .find(|param| {
+                matches!(
+                    param.kind,
+                    rustgis_analysis::ParamKind::Layer
+                        | rustgis_analysis::ParamKind::PolygonLayer
+                        | rustgis_analysis::ParamKind::PointLayer
+                        | rustgis_analysis::ParamKind::VectorLayer
+                        | rustgis_analysis::ParamKind::RasterLayer
+                )
+            })
+            .map(|param| param.name)
+            .unwrap_or("input")
+    });
+
+    let pattern = ps(p, "outputPattern").or_else(|| ps(p, "output_pattern")).unwrap_or("{input}_{tool}");
+    let base_params = p.get("params").filter(|v| v.is_object()).cloned().unwrap_or(json!({}));
+
+    // Collect inputs: from "inputs" array, wildcard "*", or "folder" directory path.
+    let mut targets: Vec<String> = Vec::new();
+
+    let is_wildcard = p.get("inputs").and_then(Value::as_str).is_some_and(|s| s == "*")
+        || p.get("inputs").and_then(Value::as_array).is_some_and(|arr| arr.len() == 1 && arr.first().and_then(Value::as_str) == Some("*"));
+
+    if is_wildcard {
+        for layer in &s.map().layers {
+            if !layer.is_raster() {
+                targets.push(layer.name.clone());
+            }
+        }
+    } else if let Some(arr) = p.get("inputs").and_then(Value::as_array) {
+        for item in arr {
+            if let Some(str_val) = item.as_str() {
+                let trimmed = str_val.trim();
+                if !trimmed.is_empty() {
+                    targets.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    if targets.is_empty()
+        && let Some(folder) = ps(p, "folder").map(str::trim).filter(|f| !f.is_empty())
+    {
+        let dir = std::path::Path::new(folder);
+        if !dir.is_dir() {
+            return Err(format!("folder '{folder}' does not exist or is not a directory"));
+        }
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            let mut files = Vec::new();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() {
+                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                    if matches!(ext.as_str(), "shp" | "geojson" | "json" | "gpkg" | "fgb" | "parquet") {
+                        files.push(path.display().to_string());
+                    }
+                }
+            }
+            files.sort();
+            targets.extend(files);
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    if targets.is_empty() && ps(p, "folder").is_some() {
+        return Err("folder batch runs are not supported in the browser; specify 'inputs' as an array of layers".into());
+    }
+
+    if targets.is_empty() {
+        return Err(
+            "no inputs provided (specify 'inputs' as an array of layers/paths, '*' for all layers, or 'folder' as a directory path)".into(),
+        );
+    }
+
+    use rustgis_analysis::control::Control;
+    use rustgis_data::progress::Probe;
+    let control = if s.stoppable { Control::stoppable() } else { Control::new() };
+    control.begin(targets.len() as u64);
+
+    let mut succeeded = Vec::new();
+    let mut failed = Vec::new();
+    let mut layer_ids = Vec::new();
+    let mut output_names = Vec::new();
+
+    for (i, target) in targets.iter().enumerate() {
+        if control.is_cancelled() {
+            s.notify(format!("Batch '{tool_id}' was cancelled at item {} of {}", i + 1, targets.len()), true);
+            break;
+        }
+
+        let base_name = std::path::Path::new(target).file_stem().and_then(|stem| stem.to_str()).unwrap_or(target);
+        let out_name = pattern.replace("{input}", base_name).replace("{tool}", tool_id);
+
+        let mut item_params = base_params.clone();
+        if let Value::Object(ref mut map) = item_params {
+            map.insert(batch_param.to_string(), json!(target));
+            map.insert("output".to_string(), json!(out_name));
+        }
+
+        match run_tool_with(s, tool_id, &item_params, &control) {
+            Ok(res) => {
+                succeeded.push(target.clone());
+                output_names.push(out_name);
+                if let Some(lid) = res.get("layer").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()) {
+                    layer_ids.push(lid);
+                } else if let Some(lids) = res.get("layers").and_then(Value::as_array) {
+                    for l in lids {
+                        if let Some(lid) = l.as_u64().and_then(|id| u32::try_from(id).ok()) {
+                            layer_ids.push(lid);
+                        }
+                    }
+                }
+            }
+            Err(err) => {
+                s.notify(format!("{target}: {err}"), true);
+                failed.push(json!({"input": target, "error": err}));
+            }
+        }
+        control.advance(1);
+    }
+
+    let total = targets.len();
+    let num_ok = succeeded.len();
+    let num_err = failed.len();
+    let summary_msg = if num_err == 0 {
+        format!("Batch '{tool_id}' complete: all {num_ok} succeeded")
+    } else {
+        format!("Batch '{tool_id}' complete: {num_ok} succeeded, {num_err} failed")
+    };
+    s.notify(summary_msg, num_err > 0);
+
+    Ok(json!({
+        "tool": tool_id,
+        "total": total,
+        "succeeded": num_ok,
+        "failed": num_err,
+        "layers": layer_ids,
+        "outputs": output_names,
+        "errors": failed
+    }))
 }
 
 /// The id of a tool named by its id or its display name (history records keep the name).
@@ -2070,5 +2243,143 @@ mod file_permission_tests {
             ..Default::default()
         };
         assert!(crate::model::output_ports(&node).is_empty(), "files must not be wired as layers");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod batch_tests {
+    use super::*;
+
+    fn test_session() -> Session {
+        let mut s = Session::new(crate::Project::default());
+        let mut cities = Dataset::new("Cities", rustgis_data::GeometryType::Point, Vec::new());
+        cities.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(10.0, 20.0))), Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, cities));
+
+        let mut parks = Dataset::new("Parks", rustgis_data::GeometryType::Point, Vec::new());
+        parks.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(15.0, 25.0))), Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(1, parks));
+        s
+    }
+
+    #[test]
+    fn batch_run_over_multiple_layers() {
+        let mut s = test_session();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities", "Parks"],
+                    "output_pattern": "{input}_buf",
+                    "params": {"distance": 50, "units": "Kilometers"}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["total"], 2);
+        assert_eq!(res["succeeded"], 2);
+        assert_eq!(res["failed"], 0);
+        let outputs = res["outputs"].as_array().unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0], "Cities_buf");
+        assert_eq!(outputs[1], "Parks_buf");
+
+        assert!(s.map().layer_by_name("Cities_buf").is_some());
+        assert!(s.map().layer_by_name("Parks_buf").is_some());
+    }
+
+    #[test]
+    fn batch_run_wildcard_all_layers() {
+        let mut s = test_session();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "convexHull",
+                    "inputs": "*",
+                    "output_pattern": "{input}_hull"
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["total"], 2);
+        assert_eq!(res["succeeded"], 2);
+        assert_eq!(res["failed"], 0);
+        assert!(s.map().layer_by_name("Cities_hull").is_some());
+        assert!(s.map().layer_by_name("Parks_hull").is_some());
+    }
+
+    #[test]
+    fn batch_run_fault_tolerance() {
+        let mut s = test_session();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities", "MissingLayer", "Parks"],
+                    "params": {"distance": 20}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["total"], 3);
+        assert_eq!(res["succeeded"], 2);
+        assert_eq!(res["failed"], 1);
+        let errs = res["errors"].as_array().unwrap();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0]["input"], "MissingLayer");
+
+        // The valid layers succeeded and were added to map
+        assert!(s.map().layer_by_name("Cities_buffer").is_some());
+        assert!(s.map().layer_by_name("Parks_buffer").is_some());
+    }
+
+    #[test]
+    fn batch_run_validation_errors() {
+        let mut s = test_session();
+        // Missing tool
+        assert!(s.run("gp.batch", &json!({"inputs": ["Cities"]})).is_err());
+        // Nonexistent tool
+        assert!(s.run("gp.batch", &json!({"tool": "nonexistent", "inputs": ["Cities"]})).is_err());
+        // Missing inputs and folder
+        assert!(s.run("gp.batch", &json!({"tool": "buffer"})).is_err());
+        // Nonexistent folder
+        assert!(s.run("gp.batch", &json!({"tool": "buffer", "folder": "/path/does/not/exist_12345"})).is_err());
+    }
+
+    #[test]
+    fn batch_run_folder_scanning() {
+        let root = std::env::temp_dir()
+            .join(format!("rustgis_batch_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let f1 = root.join("layer_a.geojson");
+        let f2 = root.join("layer_b.geojson");
+        let sample_geojson = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1.0,2.0]},"properties":{}}]}"#;
+        std::fs::write(&f1, sample_geojson).unwrap();
+        std::fs::write(&f2, sample_geojson).unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "convexHull",
+                    "folder": root.display().to_string(),
+                    "output_pattern": "{input}_hull"
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["total"], 2);
+        assert_eq!(res["succeeded"], 2);
+        assert_eq!(res["failed"], 0);
+        assert!(s.map().layer_by_name("layer_a_hull").is_some());
+        assert!(s.map().layer_by_name("layer_b_hull").is_some());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
