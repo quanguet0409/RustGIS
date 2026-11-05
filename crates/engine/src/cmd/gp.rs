@@ -1183,16 +1183,27 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         match run_tool_with(s, tool_id, &item_params, &item_control) {
             Ok(res) => {
                 succeeded.push(target.clone());
-                output_names.push(final_out_name);
-                if let Some(lid) = res.get("layer").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()) {
+                let actual_name = if let Some(lid) = res.get("layer").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()) {
                     layer_ids.push(lid);
+                    s.map().layer(lid).map(|l| l.name.clone()).unwrap_or(final_out_name)
+                } else if let Some(upd) = res.get("updated").and_then(Value::as_str) {
+                    if let Some(l) = s.map().layer_by_name(upd) {
+                        layer_ids.push(l.id);
+                        l.name.clone()
+                    } else {
+                        upd.to_string()
+                    }
                 } else if let Some(lids) = res.get("layers").and_then(Value::as_array) {
                     for l in lids {
                         if let Some(lid) = l.as_u64().and_then(|id| u32::try_from(id).ok()) {
                             layer_ids.push(lid);
                         }
                     }
-                }
+                    final_out_name
+                } else {
+                    final_out_name
+                };
+                output_names.push(actual_name);
             }
             Err(err) => {
                 failed.push(json!({"input": target, "error": err}));
@@ -1201,7 +1212,10 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
 
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(temp_id) = temp_layer_id {
-            s.map_mut().layers.retain(|l| l.id != temp_id);
+            let was_updated = layer_ids.contains(&temp_id);
+            if !was_updated {
+                s.map_mut().layers.retain(|l| l.id != temp_id);
+            }
         }
 
         control.advance(1);
@@ -2708,5 +2722,36 @@ mod batch_tests {
             !notices2.iter().any(|n| n.text.contains("skipped") || n.text.contains("invalid") || n.text.contains("params")),
             "clean input must give no skip notices: {notices2:?}"
         );
+    }
+
+    #[test]
+    fn batch_run_file_input_update_retained() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_upd_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let f1 = root.join("parcels.geojson");
+        let sample_geojson = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,1.0],[0.0,0.0]]]},"properties":{}}]}"#;
+        std::fs::write(&f1, sample_geojson).unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "calculateGeometry",
+                    "inputs": [f1.display().to_string()]
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let outputs = res["outputs"].as_array().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(s.map().layer_by_name(outputs[0].as_str().unwrap()).is_some());
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
