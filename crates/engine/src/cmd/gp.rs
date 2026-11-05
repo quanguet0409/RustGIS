@@ -1133,9 +1133,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                             let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("").to_ascii_lowercase();
                             let is_shp_sidecar = (matches!(ext.as_str(), "dbf" | "shx" | "prj" | "cpg" | "qpj" | "sbn" | "sbx" | "qix")
                                 && shp_stems.contains(&stem))
-                                || (ext == "xml"
-                                    && (shp_stems.contains(&stem)
-                                        || stem.strip_suffix(".shp").map(|s| shp_stems.contains(s)).unwrap_or(false)));
+                                || (ext == "xml" && stem.strip_suffix(".shp").map(|s| shp_stems.contains(s)).unwrap_or(false));
                             let is_gpkg_sidecar = matches!(ext.as_str(), "gpkg-wal" | "gpkg-shm" | "wal" | "shm")
                                 && (gpkg_stems.contains(&stem)
                                     || stem.strip_suffix(".gpkg").map(|s| gpkg_stems.contains(s)).unwrap_or(false));
@@ -1190,6 +1188,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     let mut read_messages: Vec<String> = Vec::new();
     let mut tool_messages: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut cancelled_after = None;
+    let mut next_suffix: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
 
     for (i, target) in targets.iter().enumerate() {
         if control.is_cancelled() {
@@ -1214,11 +1213,12 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             };
             if collision_exists(&final_out_name) {
                 let stem = final_out_name.clone();
-                let mut counter = 2;
-                while collision_exists(&final_out_name) {
-                    final_out_name = format!("{stem}_{counter}");
+                let mut counter = next_suffix.get(&stem).copied().unwrap_or(2);
+                while collision_exists(&format!("{stem}_{counter}")) {
                     counter += 1;
                 }
+                final_out_name = format!("{stem}_{counter}");
+                next_suffix.insert(stem, counter + 1);
                 had_collision = true;
             }
         }
@@ -1269,10 +1269,16 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             map.insert("output".to_string(), json!(final_out_name));
         }
 
+        let mut record_params = base_params.clone();
+        if let Value::Object(ref mut map) = record_params {
+            map.insert(batch_param.to_string(), json!(target));
+            map.insert("output".to_string(), json!(final_out_name));
+        }
+
         #[cfg(not(target_arch = "wasm32"))]
         let mut res_was_selected = false;
 
-        match run_tool_quiet(s, tool_id, &item_params, control) {
+        match run_tool_quiet(s, tool_id, &item_params, Some(&record_params), control) {
             Ok((res, messages)) => {
                 succeeded.push(target.clone());
                 for msg in messages {
@@ -1355,6 +1361,10 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 }
                 if !produced_output {
                     if item_was_selected {
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if let Some(lid) = temp_layer_id {
+                            layer_ids.push(lid);
+                        }
                         seen_outputs.insert(target_layer_name.clone());
                         output_names.push(target_layer_name.clone());
                     } else {
@@ -1522,7 +1532,7 @@ pub fn run_tool_with(
     params: &Value,
     control: &std::sync::Arc<rustgis_analysis::control::Control>,
 ) -> CmdResult {
-    run_tool_internal(s, tool, params, control, true, true).map(|(v, _)| v)
+    run_tool_internal(s, tool, params, None, control, true, true).map(|(v, _)| v)
 }
 
 /// Runs a geoprocessing tool quietly without forwarding intermediate notices to the session.
@@ -1530,9 +1540,10 @@ pub(crate) fn run_tool_quiet(
     s: &mut Session,
     tool: &str,
     params: &Value,
+    record_params: Option<&Value>,
     control: &std::sync::Arc<rustgis_analysis::control::Control>,
 ) -> Result<(Value, Vec<String>), String> {
-    run_tool_internal(s, tool, params, control, false, false)
+    run_tool_internal(s, tool, params, record_params, control, false, false)
 }
 
 /// Internal runner for geoprocessing tools, executing the tool and capturing outputs and notices.
@@ -1540,12 +1551,14 @@ fn run_tool_internal(
     s: &mut Session,
     tool: &str,
     params: &Value,
+    record_params: Option<&Value>,
     control: &std::sync::Arc<rustgis_analysis::control::Control>,
     notify_messages: bool,
     replace_tables: bool,
 ) -> Result<(Value, Vec<String>), String> {
     let tool = tool_id(tool).unwrap_or(tool).to_string();
     let params = params.clone();
+    let rec_val = record_params.unwrap_or(&params);
     let t0 = now_ms();
     if control.is_cancelled() {
         let spec = rustgis_analysis::tool(&tool);
@@ -1554,7 +1567,7 @@ fn run_tool_internal(
         return apply_inner(
             s,
             Ran { name, id: tool, command: None, started: t0 },
-            recorded(spec, params),
+            recorded(spec, rec_val.clone()),
             Err(e),
             0,
             notify_messages,
@@ -1572,7 +1585,15 @@ fn run_tool_internal(
     let millis = now_ms().saturating_sub(t0);
     let spec = rustgis_analysis::tool(&tool);
     let name = spec.map(|t| t.name).unwrap_or("Tool").to_string();
-    apply_inner(s, Ran { name, id: tool, command: None, started: t0 }, recorded(spec, params), res, millis, notify_messages, replace_tables)
+    apply_inner(
+        s,
+        Ran { name, id: tool, command: None, started: t0 },
+        recorded(spec, rec_val.clone()),
+        res,
+        millis,
+        notify_messages,
+        replace_tables,
+    )
 }
 
 /// Whether a tool can read files named by a path or vector-layer-list parameter.
@@ -3328,9 +3349,14 @@ mod batch_tests {
             .unwrap();
 
         assert_eq!(res["succeeded"], 1);
+        let layers = res["layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 1, "layers must include the updated layer id");
+        let lid = layers[0].as_u64().unwrap() as u32;
+        assert!(s.map().layer(lid).is_some());
         let outputs = res["outputs"].as_array().unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(s.map().layer_by_name(outputs[0].as_str().unwrap()).is_some());
+        assert_eq!(s.project.gp_history[0].params["input"], f1.display().to_string());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3446,6 +3472,35 @@ mod batch_tests {
         );
 
         assert!(!s.notices.iter().any(|n| n.text.contains("unsupported files skipped")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_folder_unrelated_xml_counted_as_unsupported() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_unrelxml_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let f1 = root.join("rivers.shp");
+        std::fs::write(&f1, b"").unwrap();
+        let f2 = root.join("rivers.shp.xml");
+        std::fs::write(&f2, b"<xml></xml>").unwrap();
+        let f3 = root.join("rivers.xml");
+        std::fs::write(&f3, b"<xml></xml>").unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let _ = s.run(
+            "gp.batch",
+            &json!({
+                "tool": "convexHull",
+                "folder": root.display().to_string(),
+            }),
+        );
+
+        assert!(s.notices.iter().any(|n| n.text.contains("1 unsupported files skipped")));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -3607,9 +3662,14 @@ mod batch_tests {
             .unwrap();
 
         assert_eq!(res["succeeded"], 1);
+        let layers = res["layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 1, "layers must include the selected layer id");
+        let lid = layers[0].as_u64().unwrap() as u32;
+        assert!(s.map().layer(lid).is_some());
         let outputs = res["outputs"].as_array().unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(s.map().layer_by_name(outputs[0].as_str().unwrap()).is_some());
+        assert_eq!(s.project.gp_history[0].params["input"], f1.display().to_string());
 
         let _ = std::fs::remove_dir_all(root);
     }
