@@ -1064,9 +1064,8 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     } else if let Some(arr) = p.get("inputs").and_then(Value::as_array) {
         for item in arr {
             if let Some(str_val) = item.as_str() {
-                let trimmed = str_val.trim();
-                if !trimmed.is_empty() {
-                    targets.push(trimmed.to_string());
+                if !str_val.trim().is_empty() {
+                    targets.push(str_val.to_string());
                 } else {
                     dropped_inputs += 1;
                 }
@@ -1075,9 +1074,8 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             }
         }
     } else if let Some(single_str) = p.get("inputs").and_then(Value::as_str) {
-        let trimmed = single_str.trim();
-        if !trimmed.is_empty() {
-            targets.push(trimmed.to_string());
+        if !single_str.trim().is_empty() {
+            targets.push(single_str.to_string());
         } else {
             dropped_inputs += 1;
         }
@@ -1234,9 +1232,21 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
 
         #[cfg(not(target_arch = "wasm32"))]
         let mut temp_layer_id = {
-            let path = std::path::Path::new(target);
-            if s.map().layer_by_name(target).is_none() && crate::project::find_table(&s.project.tables, target).is_none() && path.is_file()
+            let trimmed = target.trim();
+            let (file_path, was_trimmed) = if std::path::Path::new(target).is_file() {
+                (Some(std::path::Path::new(target)), false)
+            } else if trimmed != target && std::path::Path::new(trimmed).is_file() {
+                (Some(std::path::Path::new(trimmed)), true)
+            } else {
+                (None, false)
+            };
+            if s.map().layer_by_name(target).is_none()
+                && crate::project::find_table(&s.project.tables, target).is_none()
+                && let Some(path) = file_path
             {
+                if was_trimmed {
+                    s.notify(format!("gp.batch: trimmed surrounding whitespace from file path '{target}'"), false);
+                }
                 match rustgis_data::io::read_path(path) {
                     Ok((dataset, report)) => {
                         for msg in report.messages {
@@ -4674,5 +4684,69 @@ mod batch_tests {
             }),
         );
         assert_eq!(res.unwrap_err(), "'*' matched no vector layers on the active map; add a vector layer or name the inputs");
+    }
+
+    #[test]
+    fn batch_run_preserves_layer_name_with_surrounding_whitespace() {
+        let mut s = Session::new(crate::Project::default());
+        let mut ds1 = Dataset::new(" Cities ", rustgis_data::GeometryType::Point, Vec::new());
+        ds1.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(10.0, 20.0))), Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, ds1));
+
+        let mut ds2 = Dataset::new("Cities", rustgis_data::GeometryType::Point, Vec::new());
+        ds2.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(30.0, 40.0))), Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(1, ds2));
+
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": [" Cities "],
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let outputs = res["outputs"].as_array().unwrap();
+        assert_eq!(outputs[0], "Cities _buffer");
+        let out_layer = s.map().layer_by_name("Cities _buffer").unwrap();
+        let extent = out_layer.dataset.extent();
+        assert!(extent.contains(rustgis_geom::Coord::new(10.0, 20.0)));
+        assert!(!extent.contains(rustgis_geom::Coord::new(30.0, 40.0)));
+    }
+
+    #[test]
+    fn batch_run_trimmed_file_path_emits_notice() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_trim_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let f1 = root.join("cities.geojson");
+        let sample_geojson = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1.0,2.0]},"properties":{}}]}"#;
+        std::fs::write(&f1, sample_geojson).unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let padded = format!("  {}  ", f1.display());
+        let mark = s.notices.len();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": [padded],
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let notices = &s.notices[mark..];
+        assert!(notices.iter().any(|n| n.text.contains("trimmed surrounding whitespace from file path")));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
