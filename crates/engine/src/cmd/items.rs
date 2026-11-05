@@ -844,7 +844,7 @@ pub(crate) fn touches_files(command: &str, params: &Value) -> bool {
         || id == "raster.mosaic"
         || ((id == "gp.run" || id == "gp.batch")
             && params.get("tool").and_then(Value::as_str).and_then(super::gp::tool_id)
-            .and_then(rustgis_analysis::tool).is_some_and(|t| super::gp::writes_files(t) || super::gp::reads_files(t)))
+            .and_then(rustgis_analysis::tool).is_some_and(|t| super::gp::writes_files(t) || super::gp::reads_files(t) || super::gp::is_geolibre_tool(t)))
         || (id == "gp.batch"
             && (params.get("folder").is_some()
                 || (params.get("inputs").is_some() && !super::gp::is_wildcard_inputs(params.get("inputs")))))

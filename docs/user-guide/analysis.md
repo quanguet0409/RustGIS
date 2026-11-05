@@ -135,11 +135,11 @@ gp.batch={"tool":"buffer","inputs":["Cities","Rivers"],"output_pattern":"{input}
 - `"tool"`: the tool's id (such as `"buffer"`, `"simplify"`, or `"convexHull"`).
 - `"inputs"`: an array of layer names or file paths, or `"*"` to run over every vector layer on the active map.
 - `"folder"`: on desktop and the command line, a folder whose vector files (`.shp`, `.geojson`, `.json`, `.gpkg`, `.fgb`, `.parquet`) are run over in alphabetical order.
-- `"output_pattern"` or `"outputPattern"`: a naming template for resulting layers (default `"{input}_{tool}"`), where `{input}` is replaced by the layer's name or file stem, and `{tool}` by the tool id. Must include `{input}`.
+- `"output_pattern"` or `"outputPattern"`: a naming template for resulting layers (default `"{input}_{tool}"`), where `{input}` is replaced by the layer's name or file stem, and `{tool}` by the tool id. Must include `{input}`. This template applies only to tools that honor the batch output parameter, rather than tools that modify layers in place or return selections.
 - `"params"`: the static parameters shared by each run.
 - `"param"` or `"batch_param"`: which parameter receives each input (default: auto-detected as the tool's first layer parameter, else `"input"`).
 
-Batch runs are fault-tolerant: a failed run on one input logs a notice and continues with the remaining items without aborting the batch. At completion, a summary notification reports the total succeeded and failed counts.
+Batch runs are fault-tolerant: a failed run on one input continues with the remaining items without aborting the batch. At completion, if any items fail, RustGIS emits a single aggregate failure notice without individual error reasons; inspect the returned `"errors"` array in the command result for each input and its reason.
 
 These are the built-in tools; GeoLibre and plugin tools join them when available.
 Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available tools and their parameters):

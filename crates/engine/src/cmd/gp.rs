@@ -965,6 +965,7 @@ fn batch(s: &mut Session, p: &Value) -> CmdResult {
     run_batch_with(s, p, &control)
 }
 
+/// Runs a geoprocessing tool in batch across multiple layers or files with cancellation and progress reporting.
 pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustgis_analysis::control::Control>) -> CmdResult {
     use rustgis_data::progress::Probe;
     let tool_name = ps(p, "tool").ok_or("tool is required")?;
@@ -1074,6 +1075,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         }
         let mut files = Vec::new();
         let mut skipped = 0;
+        let mut symlinks = 0;
         let mut unreadable = 0;
         match std::fs::read_dir(dir) {
             Ok(entries) => {
@@ -1081,25 +1083,34 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 let mut shp_stems = std::collections::HashSet::new();
                 for entry in entries {
                     match entry {
-                        Ok(entry) => {
-                            let path = entry.path();
-                            if path.is_file() {
-                                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-                                if ext == "shp"
-                                    && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
-                                {
-                                    shp_stems.insert(stem.to_ascii_lowercase());
+                        Ok(entry) => match entry.file_type() {
+                            Ok(ft) => {
+                                if ft.is_symlink() {
+                                    symlinks += 1;
+                                } else {
+                                    let path = entry.path();
+                                    if ft.is_file() {
+                                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+                                        if ext == "shp"
+                                            && let Some(stem) = path.file_stem().and_then(|stem| stem.to_str())
+                                        {
+                                            shp_stems.insert(stem.to_ascii_lowercase());
+                                        }
+                                    }
+                                    dir_entries.push((path, ft));
                                 }
                             }
-                            dir_entries.push(path);
-                        }
+                            Err(_) => {
+                                unreadable += 1;
+                            }
+                        },
                         Err(_) => {
                             unreadable += 1;
                         }
                     }
                 }
-                for path in dir_entries {
-                    if path.is_file() {
+                for (path, ft) in dir_entries {
+                    if ft.is_file() {
                         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
                         if matches!(ext.as_str(), "shp" | "geojson" | "json" | "gpkg" | "fgb" | "parquet") {
                             files.push(path.display().to_string());
@@ -1111,7 +1122,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                                 skipped += 1;
                             }
                         }
-                    } else if path.is_dir() {
+                    } else if ft.is_dir() {
                         skipped += 1;
                     } else {
                         unreadable += 1;
@@ -1119,6 +1130,9 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 }
             }
             Err(e) => return Err(format!("folder '{folder}': {e}")),
+        }
+        if symlinks > 0 {
+            s.notify(format!("folder '{folder}': {symlinks} symlink(s) skipped"), false);
         }
         if skipped > 0 {
             s.notify(format!("folder '{folder}': {skipped} unsupported files skipped"), false);
@@ -1436,6 +1450,7 @@ pub fn run_tool_with(
     run_tool_internal(s, tool, params, control, true).map(|(v, _)| v)
 }
 
+/// Runs a geoprocessing tool quietly without forwarding intermediate notices to the session.
 pub(crate) fn run_tool_quiet(
     s: &mut Session,
     tool: &str,
@@ -1445,6 +1460,7 @@ pub(crate) fn run_tool_quiet(
     run_tool_internal(s, tool, params, control, false)
 }
 
+/// Internal runner for geoprocessing tools, executing the tool and capturing outputs and notices.
 fn run_tool_internal(
     s: &mut Session,
     tool: &str,
@@ -1622,6 +1638,7 @@ fn apply(s: &mut Session, ran: Ran, params: Value, res: Result<rustgis_analysis:
     apply_inner(s, ran, params, res, millis, true).map(|(v, _)| v)
 }
 
+/// Adds a tool's result to the map and history, optionally notifying messages to the session.
 fn apply_inner(
     s: &mut Session,
     ran: Ran,
@@ -2535,6 +2552,9 @@ mod file_permission_tests {
         assert!(!crate::cmd::items::touches_files("gp.batch", &p_wildcard));
         let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_wildcard));
         assert!(reaches.is_none());
+
+        let p_writes = json!({"tool": "vectorToPmtiles", "inputs": "*"});
+        assert!(crate::cmd::items::touches_files("gp.batch", &p_writes));
     }
 }
 
@@ -2771,6 +2791,48 @@ mod batch_tests {
         assert!(s.map().layer_by_name("layer_hull").is_some());
 
         assert!(s.notices.iter().any(|n| n.text.contains("2 unsupported files skipped")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_folder_skips_symlinks() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_symlink_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let f1 = root.join("valid.geojson");
+        let sample_geojson = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1.0,2.0]},"properties":{}}]}"#;
+        std::fs::write(&f1, sample_geojson).unwrap();
+
+        let target_file = root.join("target.geojson");
+        std::fs::write(&target_file, sample_geojson).unwrap();
+        let symlink_file = root.join("link.geojson");
+
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&target_file, &symlink_file).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&target_file, &symlink_file).is_ok();
+
+        if linked {
+            let mut s = Session::new(crate::Project::default());
+            let res = s
+                .run(
+                    "gp.batch",
+                    &json!({
+                        "tool": "convexHull",
+                        "folder": root.display().to_string(),
+                        "output_pattern": "{input}_hull"
+                    }),
+                )
+                .unwrap();
+
+            assert_eq!(res["total"], 2);
+            assert_eq!(res["succeeded"], 2);
+            assert!(s.notices.iter().any(|n| n.text.contains("1 symlink(s) skipped")));
+        }
 
         let _ = std::fs::remove_dir_all(root);
     }
