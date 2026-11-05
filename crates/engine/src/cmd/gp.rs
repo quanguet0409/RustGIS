@@ -1217,7 +1217,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         let active_before = s.active_layer;
 
         #[cfg(not(target_arch = "wasm32"))]
-        let temp_layer_id = {
+        let mut temp_layer_id = {
             let path = std::path::Path::new(target);
             if s.map().layer_by_name(target).is_none() && crate::project::find_table(&s.project.tables, target).is_none() && path.is_file()
             {
@@ -1296,16 +1296,32 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             }
         }
 
+        let is_file_input = s.map().layer_by_name(target).is_none() && crate::project::find_table(&s.project.tables, target).is_none();
+        let cmd_record = if is_file_input {
+            let mut record_json = json!({
+                "tool": tool_id,
+                "inputs": [target],
+                "params": base_params,
+            });
+            if let Some(pat) = explicit_pattern {
+                record_json["outputPattern"] = json!(pat);
+            }
+            Some(("gp.batch".to_string(), record_json))
+        } else {
+            None
+        };
+
         #[cfg(not(target_arch = "wasm32"))]
         let mut res_was_selected = false;
 
-        match run_tool_quiet(s, tool_id, &item_params, Some(&record_params), control) {
+        match run_tool_quiet(s, tool_id, &item_params, Some(&record_params), cmd_record, control) {
             Ok((res, messages)) => {
                 succeeded.push(target.clone());
+                let item_msg = messages.first().cloned();
                 if !messages.is_empty() {
                     items_reporting_messages += 1;
                     if first_tool_message.is_none() {
-                        first_tool_message = messages.first().cloned();
+                        first_tool_message = item_msg.clone();
                     }
                 }
                 if had_collision {
@@ -1392,22 +1408,33 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                         seen_outputs.insert(target_layer_name.clone());
                         output_names.push(target_layer_name.clone());
                     } else {
-                        seen_outputs.insert(final_out_name.clone());
-                        output_names.push(final_out_name);
+                        succeeded.pop();
+                        let err = item_msg.unwrap_or_else(|| "tool produced no output".into());
+                        if let Some(last) = s.project.gp_history.last_mut() {
+                            last.ok = false;
+                            if !last.messages.contains(&err) {
+                                last.messages.push(err.clone());
+                            }
+                        }
+                        failed.push(json!({"input": target, "error": err}));
+                        #[cfg(not(target_arch = "wasm32"))]
+                        if let Some(temp_id) = temp_layer_id.take() {
+                            super::layer::drop_layers(s, &[temp_id]);
+                        }
                     }
                 }
             }
             Err(err) => {
+                failed.push(json!({"input": target, "error": err}));
                 if control.is_cancelled() {
-                    cancelled_after = Some(i);
+                    cancelled_after = Some(i + 1);
                     #[cfg(not(target_arch = "wasm32"))]
-                    if let Some(temp_id) = temp_layer_id {
+                    if let Some(temp_id) = temp_layer_id.take() {
                         super::layer::drop_layers(s, &[temp_id]);
                     }
                     s.active_layer = active_before;
                     break;
                 }
-                failed.push(json!({"input": target, "error": err}));
             }
         }
 
@@ -1558,7 +1585,7 @@ pub fn run_tool_with(
     params: &Value,
     control: &std::sync::Arc<rustgis_analysis::control::Control>,
 ) -> CmdResult {
-    run_tool_internal(s, tool, params, None, control, true, true).map(|(v, _)| v)
+    run_tool_internal(s, tool, params, None, None, control, true, true).map(|(v, _)| v)
 }
 
 /// Runs a geoprocessing tool quietly without forwarding intermediate notices to the session.
@@ -1567,9 +1594,10 @@ pub(crate) fn run_tool_quiet(
     tool: &str,
     params: &Value,
     record_params: Option<&Value>,
+    command: Option<(String, Value)>,
     control: &std::sync::Arc<rustgis_analysis::control::Control>,
 ) -> Result<(Value, Vec<String>), String> {
-    run_tool_internal(s, tool, params, record_params, control, false, false)
+    run_tool_internal(s, tool, params, record_params, command, control, false, false)
 }
 
 /// Internal runner for geoprocessing tools, executing the tool and capturing outputs and notices.
@@ -1578,6 +1606,7 @@ fn run_tool_internal(
     tool: &str,
     params: &Value,
     record_params: Option<&Value>,
+    command: Option<(String, Value)>,
     control: &std::sync::Arc<rustgis_analysis::control::Control>,
     notify_messages: bool,
     replace_tables: bool,
@@ -1592,7 +1621,7 @@ fn run_tool_internal(
         let e = format!("{name} was cancelled before it started");
         return apply_inner(
             s,
-            Ran { name, id: tool, command: None, started: t0 },
+            Ran { name, id: tool, command, started: t0 },
             recorded(spec, rec_val.clone()),
             Err(e),
             0,
@@ -1613,7 +1642,7 @@ fn run_tool_internal(
     let name = spec.map(|t| t.name).unwrap_or("Tool").to_string();
     apply_inner(
         s,
-        Ran { name, id: tool, command: None, started: t0 },
+        Ran { name, id: tool, command, started: t0 },
         recorded(spec, rec_val.clone()),
         res,
         millis,
@@ -3435,6 +3464,13 @@ mod batch_tests {
         assert!(s.map().layer_by_name(outputs[0].as_str().unwrap()).is_some());
         assert_eq!(s.project.gp_history[0].params["input"], f1.display().to_string());
 
+        let (replay_cmd, replay_params) = crate::cmd::history::replay(&s.project.gp_history[0]).unwrap();
+        assert_eq!(replay_cmd, "gp.batch");
+        assert_eq!(replay_params["tool"], "calculateGeometry");
+        assert_eq!(replay_params["inputs"][0], f1.display().to_string());
+        let replay_res = s.run(&replay_cmd, &replay_params).unwrap();
+        assert_eq!(replay_res["succeeded"], 1);
+
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -3477,7 +3513,7 @@ mod batch_tests {
     }
 
     #[test]
-    fn batch_run_cancel_during_item_leaves_failed_empty() {
+    fn batch_run_cancel_during_item_records_failed_and_error() {
         let control = rustgis_analysis::control::Control::new();
         *CANCEL_CTL.lock().unwrap() = Some(control.clone());
         rustgis_analysis::register_external(
@@ -3518,12 +3554,74 @@ mod batch_tests {
 
         *CANCEL_CTL.lock().unwrap() = None;
 
-        assert_eq!(res["failed"], 0);
+        assert_eq!(res["failed"], 1);
         assert_eq!(res["succeeded"], 0);
         assert_eq!(res["cancelled"], true);
-        assert_eq!(res["errors"].as_array().unwrap().len(), 0);
-        assert!(!s.notices.iter().any(|n| n.text.contains("failed")));
-        assert!(s.notices.iter().any(|n| n.text.contains("cancelled after 0 of 1")));
+        assert_eq!(res["errors"].as_array().unwrap().len(), 1);
+        assert_eq!(res["errors"][0]["error"], "Cancel Item Tool was cancelled");
+        assert!(s.notices.iter().any(|n| n.text.contains("1 failed (L1)")));
+        assert!(s.notices.iter().any(|n| n.text.contains("cancelled after 1 of 1")));
+    }
+
+    fn empty_output_runner(
+        _spec: &rustgis_analysis::ToolSpec,
+        _inputs: &dyn rustgis_analysis::Inputs,
+        _params: &serde_json::Value,
+    ) -> Result<rustgis_analysis::ToolResult, String> {
+        Ok(rustgis_analysis::ToolResult {
+            output: rustgis_analysis::Output::Layers(Vec::new()),
+            messages: vec!["custom message from empty tool".to_string()],
+        })
+    }
+
+    #[test]
+    fn batch_run_tool_producing_no_output_is_failure() {
+        rustgis_analysis::register_external(
+            "test_empty_output_suite",
+            || {
+                vec![rustgis_analysis::ToolSpec {
+                    id: "test:empty_output",
+                    name: "Empty Output Tool",
+                    toolbox: "Test",
+                    summary: "",
+                    params: &[rustgis_analysis::ParamSpec {
+                        name: "input",
+                        label: "Input Layer",
+                        kind: rustgis_analysis::ParamKind::Layer,
+                        required: true,
+                        default: "",
+                        help: "",
+                    }],
+                    run: rustgis_analysis::external_placeholder,
+                }]
+            },
+            empty_output_runner,
+        );
+
+        let mut s = Session::new(crate::Project::default());
+        let ds = Dataset::new("L1", rustgis_data::GeometryType::Point, Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, ds));
+
+        let mark = s.notices.len();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "test:empty_output",
+                    "inputs": ["L1"],
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["failed"], 1);
+        assert_eq!(res["succeeded"], 0);
+        let errs = res["errors"].as_array().unwrap();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0]["input"], "L1");
+        assert_eq!(errs[0]["error"], "custom message from empty tool");
+        let outputs = res["outputs"].as_array().unwrap();
+        assert!(outputs.is_empty(), "must not emit phantom output name");
+        assert!(s.notices[mark..].iter().any(|n| n.text.contains("1 failed (L1)")));
     }
 
     #[test]
@@ -3750,6 +3848,13 @@ mod batch_tests {
         assert_eq!(outputs.len(), 1);
         assert!(s.map().layer_by_name(outputs[0].as_str().unwrap()).is_some());
         assert_eq!(s.project.gp_history[0].params["input"], f1.display().to_string());
+
+        let (replay_cmd, replay_params) = crate::cmd::history::replay(&s.project.gp_history[0]).unwrap();
+        assert_eq!(replay_cmd, "gp.batch");
+        assert_eq!(replay_params["tool"], "selectByAttributes");
+        assert_eq!(replay_params["inputs"][0], f1.display().to_string());
+        let replay_res = s.run(&replay_cmd, &replay_params).unwrap();
+        assert_eq!(replay_res["succeeded"], 1);
 
         let _ = std::fs::remove_dir_all(root);
     }
