@@ -1007,10 +1007,12 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         return Err(format!("tool '{tool_id}' writes a file, not a layer; gp.batch runs tools that add layers"));
     }
 
-    let pattern = ps(p, "outputPattern").or_else(|| ps(p, "output_pattern")).unwrap_or("{input}_{tool}");
+    let explicit_pattern = ps(p, "outputPattern").or_else(|| ps(p, "output_pattern"));
+    let pattern = explicit_pattern.unwrap_or("{input}_{tool}");
     if !pattern.contains("{input}") {
         return Err("outputPattern must include '{input}' to avoid output name collisions".into());
     }
+    let tool_has_output = spec.params.iter().any(|param| param.name == "output");
 
     let base_params = match p.get("params") {
         Some(v) if v.is_object() => v.clone(),
@@ -1186,7 +1188,8 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     let mut first_collision = None;
     #[allow(unused_mut)]
     let mut read_messages: Vec<String> = Vec::new();
-    let mut tool_messages: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut items_reporting_messages = 0;
+    let mut first_tool_message = None;
     let mut cancelled_after = None;
     let mut next_suffix: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
 
@@ -1241,7 +1244,6 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             None if crate::project::find_table(&s.project.tables, target).is_some() => target.as_str(),
             None => std::path::Path::new(target).file_stem().and_then(|stem| stem.to_str()).unwrap_or(target),
         };
-        let tool_has_output = spec.params.iter().any(|param| param.name == "output");
         let out_name = pattern.replace("{input}", base_name).replace("{tool}", tool_id);
         let mut final_out_name = out_name.clone();
         let mut had_collision = false;
@@ -1266,13 +1268,17 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         let mut item_params = base_params.clone();
         if let Value::Object(ref mut map) = item_params {
             map.insert(batch_param.to_string(), json!(target_layer_name));
-            map.insert("output".to_string(), json!(final_out_name));
+            if tool_has_output {
+                map.insert("output".to_string(), json!(final_out_name));
+            }
         }
 
         let mut record_params = base_params.clone();
         if let Value::Object(ref mut map) = record_params {
             map.insert(batch_param.to_string(), json!(target));
-            map.insert("output".to_string(), json!(final_out_name));
+            if tool_has_output {
+                map.insert("output".to_string(), json!(final_out_name));
+            }
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -1281,8 +1287,11 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         match run_tool_quiet(s, tool_id, &item_params, Some(&record_params), control) {
             Ok((res, messages)) => {
                 succeeded.push(target.clone());
-                for msg in messages {
-                    *tool_messages.entry(msg).or_insert(0) += 1;
+                if !messages.is_empty() {
+                    items_reporting_messages += 1;
+                    if first_tool_message.is_none() {
+                        first_tool_message = messages.first().cloned();
+                    }
                 }
                 if had_collision {
                     collisions += 1;
@@ -1397,15 +1406,17 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         s.active_layer = active_before;
     }
 
-    if tool_messages.len() <= 3 {
-        for (msg, count) in &tool_messages {
-            s.notify(format!("gp.batch: {count} item(s) reported: {msg}"), false);
-        }
-    } else {
-        let total_reported: usize = tool_messages.values().sum();
-        let sample = tool_messages.keys().take(2).cloned().collect::<Vec<_>>().join("; ");
+    if items_reporting_messages > 0 {
+        let first = first_tool_message.unwrap_or_default();
+        s.notify(format!("gp.batch: {items_reporting_messages} item(s) reported messages (first: {first})"), false);
+    }
+
+    if explicit_pattern.is_some() && !tool_has_output && !succeeded.is_empty() {
+        let count = succeeded.len();
         s.notify(
-            format!("gp.batch: {total_reported} message(s) reported across items (e.g. {sample}; and {} more)", tool_messages.len() - 2),
+            format!(
+                "gp.batch: 'outputPattern' does not apply to '{tool_id}' (it names its outputs itself); {count} item(s) used their own names"
+            ),
             false,
         );
     }
@@ -3724,7 +3735,91 @@ mod batch_tests {
 
         assert_eq!(res["succeeded"], 2);
         let notices = &s.notices[mark..];
-        assert!(notices.iter().any(|n| n.text.contains("2 item(s) reported: Buffer: 1 features at 10 Kilometers")));
+        assert!(notices.iter().any(|n| n.text.contains("2 item(s) reported messages (first: Buffer: 1 features at 10 Kilometers)")));
+    }
+
+    #[test]
+    fn batch_run_different_feature_counts_emits_single_message_notice() {
+        let mut s = Session::new(crate::Project::default());
+        let mut l1 = Dataset::new("Layer1", rustgis_data::GeometryType::Point, Vec::new());
+        l1.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(10.0, 20.0))), Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, l1));
+
+        let mut l2 = Dataset::new("Layer2", rustgis_data::GeometryType::Point, Vec::new());
+        l2.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(15.0, 25.0))), Vec::new());
+        l2.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(16.0, 26.0))), Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(1, l2));
+
+        let mark = s.notices.len();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Layer1", "Layer2"],
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 2);
+        let recent: Vec<_> = s.notices[mark..].iter().filter(|n| n.text.contains("reported messages")).collect();
+        assert_eq!(recent.len(), 1, "must emit exactly one tool messages notice: {recent:?}");
+        assert_eq!(recent[0].text, "gp.batch: 2 item(s) reported messages (first: Buffer: 1 features at 10 Kilometers)");
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn batch_run_output_pattern_on_tool_without_output_emits_notice() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_opt_notice_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let p1 = root.join("cities1.geojson");
+        let p2 = root.join("cities2.geojson");
+        let content = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[10.0,20.0]},"properties":{"pop":100}}]}"#;
+        std::fs::write(&p1, content).unwrap();
+        std::fs::write(&p2, content).unwrap();
+
+        // 1. Run with outputPattern: emits notice
+        let mut s = Session::new(crate::Project::default());
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "summaryStatistics",
+                    "inputs": [p1.to_str().unwrap(), p2.to_str().unwrap()],
+                    "outputPattern": "{input}_stats",
+                    "params": {"field": "pop"}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res["succeeded"], 2);
+        assert!(
+            s.notices.iter().any(|n| n.text.contains(
+                "'outputPattern' does not apply to 'summaryStatistics' (it names its outputs itself); 2 item(s) used their own names"
+            )),
+            "notices: {:?}",
+            s.notices
+        );
+
+        // 2. Clean run without outputPattern: emits no notice
+        let mut s_clean = Session::new(crate::Project::default());
+        let res_clean = s_clean
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "summaryStatistics",
+                    "inputs": [p1.to_str().unwrap(), p2.to_str().unwrap()],
+                    "params": {"field": "pop"}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res_clean["succeeded"], 2);
+        assert!(!s_clean.notices.iter().any(|n| n.text.contains("'outputPattern' does not apply")), "clean run must not emit notice");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3839,7 +3934,7 @@ mod batch_tests {
         assert_eq!(res["succeeded"], 2);
         let recent = s.notices_since(mark);
         assert!(!recent.iter().any(|t| t.text.contains("Prior notification")));
-        assert!(recent.iter().any(|t| t.text.contains("2 item(s) reported: Buffer: 1 features at 10 Kilometers")));
+        assert!(recent.iter().any(|t| t.text.contains("2 item(s) reported messages (first: Buffer: 1 features at 10 Kilometers)")));
     }
 
     #[test]
