@@ -1216,7 +1216,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     #[allow(unused_mut)]
     let mut read_messages: Vec<String> = Vec::new();
     let mut items_reporting_messages = 0;
-    let mut first_tool_message = None;
+    let mut distinct_tool_messages: Vec<(String, usize)> = Vec::new();
     let mut cancelled_after = None;
     let mut next_suffix: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
 
@@ -1332,11 +1332,14 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         match run_tool_quiet(s, tool_id, &item_params, Some(&record_params), cmd_record, control) {
             Ok((res, messages)) => {
                 succeeded.push(target.clone());
-                let item_msg = messages.first().cloned();
                 if !messages.is_empty() {
                     items_reporting_messages += 1;
-                    if first_tool_message.is_none() {
-                        first_tool_message = item_msg.clone();
+                    for msg in &messages {
+                        if let Some(entry) = distinct_tool_messages.iter_mut().find(|(m, _)| m == msg) {
+                            entry.1 += 1;
+                        } else {
+                            distinct_tool_messages.push((msg.clone(), 1));
+                        }
                     }
                 }
 
@@ -1488,8 +1491,14 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     }
 
     if items_reporting_messages > 0 {
-        let first = first_tool_message.unwrap_or_default();
-        s.notify(format!("gp.batch: {items_reporting_messages} item(s) reported messages (first: {first})"), false);
+        let sample = distinct_tool_messages
+            .iter()
+            .take(3)
+            .map(|(m, c)| if *c > 1 { format!("{m} (×{c})") } else { m.clone() })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let more = if distinct_tool_messages.len() > 3 { format!(" and {} more", distinct_tool_messages.len() - 3) } else { String::new() };
+        s.notify(format!("gp.batch: {items_reporting_messages} item(s) reported messages ({sample}{more})"), false);
     }
 
     if explicit_pattern.is_some() && !tool_has_output && !succeeded.is_empty() {
@@ -1508,8 +1517,22 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     }
 
     if !read_messages.is_empty() {
-        let first = read_messages.first().map(String::as_str).unwrap_or("");
-        s.notify(format!("gp.batch: {} notice(s) reading inputs (first: {first})", read_messages.len()), false);
+        let mut distinct_reads: Vec<(&str, usize)> = Vec::new();
+        for msg in &read_messages {
+            if let Some(entry) = distinct_reads.iter_mut().find(|(m, _)| *m == msg.as_str()) {
+                entry.1 += 1;
+            } else {
+                distinct_reads.push((msg.as_str(), 1));
+            }
+        }
+        let sample = distinct_reads
+            .iter()
+            .take(3)
+            .map(|(m, c)| if *c > 1 { format!("{m} (×{c})") } else { m.to_string() })
+            .collect::<Vec<_>>()
+            .join("; ");
+        let more = if distinct_reads.len() > 3 { format!(" and {} more", distinct_reads.len() - 3) } else { String::new() };
+        s.notify(format!("gp.batch: {} notice(s) reading inputs ({sample}{more})", read_messages.len()), false);
     }
 
     if !failed.is_empty() {
@@ -4164,7 +4187,7 @@ mod batch_tests {
 
         assert_eq!(res["succeeded"], 2);
         let notices = &s.notices[mark..];
-        assert!(notices.iter().any(|n| n.text.contains("2 item(s) reported messages (first: Buffer: 1 features at 10 Kilometers)")));
+        assert!(notices.iter().any(|n| n.text.contains("2 item(s) reported messages (Buffer: 1 features at 10 Kilometers (×2))")));
     }
 
     #[test]
@@ -4194,7 +4217,41 @@ mod batch_tests {
         assert_eq!(res["succeeded"], 2);
         let recent: Vec<_> = s.notices[mark..].iter().filter(|n| n.text.contains("reported messages")).collect();
         assert_eq!(recent.len(), 1, "must emit exactly one tool messages notice: {recent:?}");
-        assert_eq!(recent[0].text, "gp.batch: 2 item(s) reported messages (first: Buffer: 1 features at 10 Kilometers)");
+        assert_eq!(
+            recent[0].text,
+            "gp.batch: 2 item(s) reported messages (Buffer: 1 features at 10 Kilometers; Buffer: 2 features at 10 Kilometers)"
+        );
+    }
+
+    #[test]
+    fn batch_run_different_tool_messages_named_in_notice() {
+        let mut s = Session::new(crate::Project::default());
+        let mut l1 = Dataset::new("Layer1", rustgis_data::GeometryType::Point, Vec::new());
+        l1.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(10.0, 20.0))), Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, l1));
+
+        let mut l2 = Dataset::new("Layer2", rustgis_data::GeometryType::Point, Vec::new());
+        l2.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(15.0, 25.0))), Vec::new());
+        l2.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(16.0, 26.0))), Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(1, l2));
+
+        let mark = s.notices.len();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Layer1", "Layer2"],
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 2);
+        let notices = &s.notices[mark..];
+        let msg_notice = notices.iter().find(|n| n.text.contains("reported messages")).unwrap();
+        assert!(msg_notice.text.contains("Buffer: 1 features at 10 Kilometers"));
+        assert!(msg_notice.text.contains("Buffer: 2 features at 10 Kilometers"));
     }
 
     #[test]
@@ -4504,7 +4561,7 @@ mod batch_tests {
         assert_eq!(res["succeeded"], 2);
         let recent = s.notices_since(mark);
         assert!(!recent.iter().any(|t| t.text.contains("Prior notification")));
-        assert!(recent.iter().any(|t| t.text.contains("2 item(s) reported messages (first: Buffer: 1 features at 10 Kilometers)")));
+        assert!(recent.iter().any(|t| t.text.contains("2 item(s) reported messages (Buffer: 1 features at 10 Kilometers (×2))")));
     }
 
     #[test]
