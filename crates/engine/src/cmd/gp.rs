@@ -992,10 +992,11 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     if p.get("batch_param").is_some_and(|v| !v.is_null() && !v.is_string()) {
         s.notify("gp.batch: 'batch_param' must be a string, ignoring invalid value", false);
     }
-    if p.get("outputPattern").is_some_and(|v| !v.is_null() && !v.is_string())
-        || p.get("output_pattern").is_some_and(|v| !v.is_null() && !v.is_string())
-    {
+    if p.get("outputPattern").is_some_and(|v| !v.is_null() && !v.is_string()) {
         s.notify("gp.batch: 'outputPattern' must be a string, ignoring invalid value", false);
+    }
+    if p.get("output_pattern").is_some_and(|v| !v.is_null() && !v.is_string()) {
+        s.notify("gp.batch: 'output_pattern' must be a string, ignoring invalid value", false);
     }
 
     if let Value::Object(map) = p {
@@ -1245,6 +1246,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     let mut distinct_tool_messages: Vec<(String, usize)> = Vec::new();
     let mut cancelled_after = None;
     let mut next_suffix: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let mut trimmed_paths = 0;
 
     for (i, target) in targets.iter().enumerate() {
         if control.is_cancelled() {
@@ -1269,7 +1271,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 && let Some(path) = file_path
             {
                 if was_trimmed {
-                    s.notify(format!("gp.batch: trimmed surrounding whitespace from file path '{target}'"), false);
+                    trimmed_paths += 1;
                 }
                 match rustgis_data::io::read_path(path) {
                     Ok((dataset, report)) => {
@@ -1526,6 +1528,10 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             }
         }
         s.active_layer = active_before;
+    }
+
+    if trimmed_paths > 0 {
+        s.notify(format!("gp.batch: {trimmed_paths} file path(s) trimmed of surrounding whitespace"), false);
     }
 
     if items_reporting_messages > 0 {
@@ -3250,7 +3256,7 @@ mod batch_tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "macos")))]
     #[test]
     fn batch_run_folder_skips_non_utf8_filename() {
         use std::os::unix::ffi::OsStrExt;
@@ -4817,7 +4823,7 @@ mod batch_tests {
 
         assert_eq!(res["succeeded"], 1);
         let notices = &s.notices[mark..];
-        assert!(notices.iter().any(|n| n.text.contains("trimmed surrounding whitespace from file path")));
+        assert!(notices.iter().any(|n| n.text.contains("1 file path(s) trimmed of surrounding whitespace")));
 
         let _ = std::fs::remove_dir_all(root);
     }

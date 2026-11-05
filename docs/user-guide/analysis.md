@@ -133,7 +133,7 @@ gp.batch={"tool":"buffer","inputs":["Cities","Rivers"],"output_pattern":"{input}
 ```
 
 - `"tool"`: the tool's id (such as `"buffer"`, `"simplify"`, or `"convexHull"`).
-- `"inputs"`: an array of layer names or file paths, or `"*"` to run over every vector layer on the active map.
+- `"inputs"`: an array of layer names or file paths, or `"*"` to run over every vector layer on the active map (including hidden layers; raster and graphics layers are left out with a notice).
 - `"folder"`: on desktop and the command line, a folder whose vector and tabular files (`.shp`, `.geojson`, `.json`, `.gpkg`, `.fgb`, `.parquet`, `.geoparquet`, `.kml`, `.kmz`, `.gpx`, `.csv`) are run over in alphabetical order.
 - `"output_pattern"` or `"outputPattern"`: a naming template for resulting layers (default `"{input}_{tool}"`), where `{input}` is replaced by the layer's name or file stem, and `{tool}` by the tool id. Must include `{input}`. This template applies only to tools that honor the batch output parameter, rather than tools that modify layers in place or return selections.
 - `"params"`: the static parameters shared by each run. If a parameter matching the batch parameter name is included in `"params"` (such as `"input"`), the batch inputs take precedence, replacing it for each item and emitting a notice.
@@ -142,6 +142,8 @@ gp.batch={"tool":"buffer","inputs":["Cities","Rivers"],"output_pattern":"{input}
 Batch runs are fault-tolerant: a failed run on one input continues with the remaining items without aborting the batch. At completion, if any items fail, RustGIS emits a single aggregate failure notice without individual error reasons; inspect the returned `"errors"` array in the command result for each input and its reason.
 
 Because `gp.batch` can read datasets from disk in the current working directory, all explicit `inputs` (layer names or file paths) and `folder` specifications are classified as file access (`Reach::Files`), requiring assistant confirmation and restricted in imported tasks without file permissions. A wildcard run (`inputs: "*"`) is file access only when the tool reads files through a `Path` or `VectorLayers` parameter or runs a GeoLibre program; otherwise it runs over the active map's layers without file access. Tools that write files are refused.
+
+### Built-in tools
 
 These are the built-in tools; GeoLibre and plugin tools join them when available.
 Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available tools and their parameters):
