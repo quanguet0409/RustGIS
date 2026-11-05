@@ -1364,9 +1364,8 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 }
             }
             Err(err) => {
-                failed.push(json!({"input": target, "error": err}));
                 if control.is_cancelled() {
-                    cancelled_after = Some(i + 1);
+                    cancelled_after = Some(i);
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(temp_id) = temp_layer_id {
                         super::layer::drop_layers(s, &[temp_id]);
@@ -1374,6 +1373,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     s.active_layer = active_before;
                     break;
                 }
+                failed.push(json!({"input": target, "error": err}));
             }
         }
 
@@ -3358,27 +3358,69 @@ mod batch_tests {
         assert!(s.notices.iter().any(|n| n.text.contains("cancelled after 0 of 2")));
     }
 
+    static CANCEL_CTL: std::sync::Mutex<Option<std::sync::Arc<rustgis_analysis::control::Control>>> = std::sync::Mutex::new(None);
+
+    fn cancel_item_runner(
+        _spec: &rustgis_analysis::ToolSpec,
+        _inputs: &dyn rustgis_analysis::Inputs,
+        _params: &serde_json::Value,
+    ) -> Result<rustgis_analysis::ToolResult, String> {
+        if let Ok(guard) = CANCEL_CTL.lock()
+            && let Some(ctl) = guard.as_ref()
+        {
+            ctl.cancel();
+        }
+        Err("cancelled in tool".into())
+    }
+
     #[test]
-    fn batch_run_cancelled_failing_item_records_error() {
-        let mut s = test_session();
+    fn batch_run_cancel_during_item_leaves_failed_empty() {
         let control = rustgis_analysis::control::Control::new();
-        // Item fails during execution (nonexistent input layer):
+        *CANCEL_CTL.lock().unwrap() = Some(control.clone());
+        rustgis_analysis::register_external(
+            "test_cancel_during_item_suite",
+            || {
+                vec![rustgis_analysis::ToolSpec {
+                    id: "test:cancel_item",
+                    name: "Cancel Item Tool",
+                    toolbox: "Test",
+                    summary: "",
+                    params: &[rustgis_analysis::ParamSpec {
+                        name: "input",
+                        label: "Input Layer",
+                        kind: rustgis_analysis::ParamKind::Layer,
+                        required: true,
+                        default: "",
+                        help: "",
+                    }],
+                    run: rustgis_analysis::external_placeholder,
+                }]
+            },
+            cancel_item_runner,
+        );
+
+        let mut s = Session::new(crate::Project::default());
+        let ds = Dataset::new("L1", rustgis_data::GeometryType::Point, Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, ds));
+
         let res = run_batch_with(
             &mut s,
             &json!({
-                "tool": "buffer",
-                "inputs": ["NonExistent"],
-                "params": {"distance": 10}
+                "tool": "test:cancel_item",
+                "inputs": ["L1"],
             }),
             &control,
         )
         .unwrap();
 
-        assert_eq!(res["total"], 1);
-        assert_eq!(res["failed"], 1);
-        let errors = res["errors"].as_array().unwrap();
-        assert_eq!(errors.len(), 1);
-        assert_eq!(errors[0]["input"], "NonExistent");
+        *CANCEL_CTL.lock().unwrap() = None;
+
+        assert_eq!(res["failed"], 0);
+        assert_eq!(res["succeeded"], 0);
+        assert_eq!(res["cancelled"], true);
+        assert_eq!(res["errors"].as_array().unwrap().len(), 0);
+        assert!(!s.notices.iter().any(|n| n.text.contains("failed")));
+        assert!(s.notices.iter().any(|n| n.text.contains("cancelled after 0 of 1")));
     }
 
     #[test]
