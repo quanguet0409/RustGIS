@@ -1225,6 +1225,13 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         return Err("'*' matched no vector layers on the active map; add a vector layer or name the inputs".into());
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    if targets.is_empty()
+        && let Some(folder) = ps(p, "folder")
+    {
+        return Err(format!("folder '{folder}' has no supported vector files"));
+    }
+
     if targets.is_empty() {
         return Err(
             "no inputs provided (specify 'inputs' as an array of layers/paths, '*' for all layers, or 'folder' as a directory path)".into(),
@@ -1256,6 +1263,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         }
 
         let active_before = s.active_layer;
+        let is_file_input = s.map().layer_by_name(target).is_none() && crate::project::find_table(&s.project.tables, target).is_none();
 
         #[cfg(not(target_arch = "wasm32"))]
         let mut temp_layer_id = {
@@ -1267,10 +1275,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             } else {
                 (None, false)
             };
-            if s.map().layer_by_name(target).is_none()
-                && crate::project::find_table(&s.project.tables, target).is_none()
-                && let Some(path) = file_path
-            {
+            if is_file_input && let Some(path) = file_path {
                 if was_trimmed {
                     trimmed_paths += 1;
                 }
@@ -1313,7 +1318,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         let base_name = match s.map().layer_by_name(target) {
             Some(layer) => layer.name.as_str(),
             None if crate::project::find_table(&s.project.tables, target).is_some() => target.as_str(),
-            None => std::path::Path::new(target).file_stem().and_then(|stem| stem.to_str()).unwrap_or(target),
+            None => std::path::Path::new(target.trim()).file_stem().and_then(|stem| stem.to_str()).unwrap_or(target.trim()),
         };
         let out_name = pattern.replace("{input}", base_name).replace("{tool}", tool_id);
         let mut final_out_name = out_name.clone();
@@ -1351,7 +1356,6 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             }
         }
 
-        let is_file_input = s.map().layer_by_name(target).is_none() && crate::project::find_table(&s.project.tables, target).is_none();
         let cmd_record = if is_file_input {
             let mut record_json = json!({
                 "tool": tool_id,
@@ -4824,8 +4828,62 @@ mod batch_tests {
             .unwrap();
 
         assert_eq!(res["succeeded"], 1);
+        let outputs = res["outputs"].as_array().unwrap();
+        assert_eq!(outputs[0], "cities_buffer");
         let notices = &s.notices[mark..];
         assert!(notices.iter().any(|n| n.text.contains("1 file path(s) trimmed of surrounding whitespace")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_empty_folder_returns_specific_error() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_empty_folder_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let res = s.run(
+            "gp.batch",
+            &json!({
+                "tool": "convexHull",
+                "folder": root.display().to_string()
+            }),
+        );
+        assert_eq!(res.unwrap_err(), format!("folder '{}' has no supported vector files", root.display()));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_file_input_named_like_dataset_records_gp_batch_in_history() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_samename_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let f1 = root.join("cities.geojson");
+        let sample_geojson = r#"{"type":"FeatureCollection","name":"cities.geojson","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1.0,2.0]},"properties":{}}]}"#;
+        std::fs::write(&f1, sample_geojson).unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": [f1.display().to_string()],
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let (replay_cmd, _) = crate::cmd::history::replay(s.project.gp_history.last().unwrap()).unwrap();
+        assert_eq!(replay_cmd, "gp.batch");
 
         let _ = std::fs::remove_dir_all(root);
     }
