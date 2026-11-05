@@ -998,6 +998,9 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     if p.get("output_pattern").is_some_and(|v| !v.is_null() && !v.is_string()) {
         s.notify("gp.batch: 'output_pattern' must be a string, ignoring invalid value", false);
     }
+    if p.get("folder").is_some_and(|v| !v.is_null() && !v.is_string()) {
+        s.notify("gp.batch: 'folder' must be a string, ignoring invalid value", false);
+    }
 
     if let Value::Object(map) = p {
         let recognized = ["tool", "param", "batch_param", "outputPattern", "output_pattern", "params", "inputs", "folder"];
@@ -1109,7 +1112,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         s.notify(format!("gp.batch: {dropped_inputs} invalid input(s) skipped (not a valid layer name or file path)"), false);
     }
 
-    if p.get("folder").is_some_and(|v| !v.is_null()) && !targets.is_empty() {
+    if ps(p, "folder").is_some() && !targets.is_empty() {
         s.notify("both 'inputs' and 'folder' were provided; running 'inputs' and ignoring 'folder'", false);
     }
 
@@ -4898,6 +4901,47 @@ mod batch_tests {
         assert_eq!(replay_cmd, "gp.batch");
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_numeric_folder_notified_and_ignored() {
+        let mut s = test_session();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "folder": 123,
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res["succeeded"], 1);
+        assert!(s.notices.iter().any(|n| n.text.contains("gp.batch: 'folder' must be a string, ignoring invalid value")));
+        assert!(!s.notices.iter().any(|n| n.text.contains("both 'inputs' and 'folder' were provided")));
+    }
+
+    #[test]
+    fn batch_run_all_failed_returns_ok_with_errors_array() {
+        let mut s = Session::new(crate::Project::default());
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["NonExistentLayer1", "NonExistentLayer2"],
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["total"], 2);
+        assert_eq!(res["succeeded"], 0);
+        assert_eq!(res["failed"], 2);
+        let errors = res["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 2);
+        assert!(s.notices.iter().any(|n| n.text.contains("2 failed (NonExistentLayer1, NonExistentLayer2)")));
     }
 
     #[test]
