@@ -1227,7 +1227,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
 
     #[cfg(not(target_arch = "wasm32"))]
     if targets.is_empty()
-        && let Some(folder) = ps(p, "folder")
+        && let Some(folder) = ps(p, "folder").map(str::trim).filter(|f| !f.is_empty())
     {
         return Err(format!("folder '{folder}' has no supported vector files"));
     }
@@ -4853,6 +4853,18 @@ mod batch_tests {
             }),
         );
         assert_eq!(res.unwrap_err(), format!("folder '{}' has no supported vector files", root.display()));
+
+        let res_blank = s.run(
+            "gp.batch",
+            &json!({
+                "tool": "convexHull",
+                "folder": "   "
+            }),
+        );
+        assert_eq!(
+            res_blank.unwrap_err(),
+            "no inputs provided (specify 'inputs' as an array of layers/paths, '*' for all layers, or 'folder' as a directory path)"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }

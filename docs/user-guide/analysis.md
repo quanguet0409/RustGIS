@@ -141,7 +141,7 @@ gp.batch={"tool":"buffer","inputs":["Cities","Rivers"],"output_pattern":"{input}
 
 Batch runs are fault-tolerant: a failed run on one input continues with the remaining items without aborting the batch. At completion, if any items fail, RustGIS emits a single aggregate failure notice without individual error reasons; inspect the returned `"errors"` array in the command result for each input and its reason.
 
-Because `gp.batch` can read datasets from disk in the current working directory, all explicit `inputs` (layer names or file paths) and `folder` specifications are classified as file access (`Reach::Files`), requiring assistant confirmation and restricted in imported tasks without file permissions. A wildcard run (`inputs: "*"`) is file access only when the tool reads files through a `Path` or `VectorLayers` parameter or runs a GeoLibre program; otherwise it runs over the active map's layers without file access. Tools that write files are refused.
+Because `gp.batch` can read datasets from disk in the current working directory, all explicit `inputs` (layer names or file paths) and `folder` specifications are classified as file access (`Reach::Files`), requiring assistant confirmation and restricted in imported tasks without file permissions. A wildcard run (`inputs: "*"`) is file access only when the tool reads files through a `Path` or `VectorLayers` parameter, runs a GeoLibre program, or sets static parameters naming files, paths or connections (matching `PLACE_KEYS`); otherwise it runs over the active map's layers without file access. Tools that write files are refused.
 
 ### Built-in tools
 
