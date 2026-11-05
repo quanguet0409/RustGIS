@@ -134,7 +134,7 @@ gp.batch={"tool":"buffer","inputs":["Cities","Rivers"],"output_pattern":"{input}
 
 - `"tool"`: the tool's id (such as `"buffer"`, `"simplify"`, or `"convexHull"`).
 - `"inputs"`: an array of layer names or file paths, or `"*"` to run over every vector layer on the active map.
-- `"folder"`: on desktop and the command line, a folder whose vector files (`.shp`, `.geojson`, `.json`, `.gpkg`, `.fgb`, `.parquet`) are run over in alphabetical order.
+- `"folder"`: on desktop and the command line, a folder whose vector and tabular files (`.shp`, `.geojson`, `.json`, `.gpkg`, `.fgb`, `.parquet`, `.geoparquet`, `.kml`, `.kmz`, `.gpx`, `.csv`) are run over in alphabetical order.
 - `"output_pattern"` or `"outputPattern"`: a naming template for resulting layers (default `"{input}_{tool}"`), where `{input}` is replaced by the layer's name or file stem, and `{tool}` by the tool id. Must include `{input}`. This template applies only to tools that honor the batch output parameter, rather than tools that modify layers in place or return selections.
 - `"params"`: the static parameters shared by each run. If a parameter matching the batch parameter name is included in `"params"` (such as `"input"`), the batch inputs take precedence, replacing it for each item and emitting a notice.
 - `"param"` or `"batch_param"`: which parameter receives each input (default: auto-detected as the tool's first layer parameter, else `"input"`).

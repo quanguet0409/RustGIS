@@ -1170,7 +1170,10 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 for (path, ft) in dir_entries {
                     if ft.is_file() {
                         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-                        if matches!(ext.as_str(), "shp" | "geojson" | "json" | "gpkg" | "fgb" | "parquet") {
+                        if matches!(
+                            ext.as_str(),
+                            "shp" | "geojson" | "json" | "gpkg" | "fgb" | "parquet" | "geoparquet" | "kml" | "kmz" | "gpx" | "csv"
+                        ) {
                             files.push(path.display().to_string());
                         } else {
                             let stem = path.file_stem().and_then(|stem| stem.to_str()).unwrap_or("").to_ascii_lowercase();
@@ -3126,6 +3129,48 @@ mod batch_tests {
         assert!(s.map().layer_by_name("layer_hull").is_some());
 
         assert!(s.notices.iter().any(|n| n.text.contains("2 unsupported files skipped")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_folder_includes_gpx_kml_csv() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_formats_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let csv = root.join("points.csv");
+        let gpx = root.join("track.gpx");
+        let kml = root.join("places.kml");
+        let txt = root.join("info.txt");
+
+        std::fs::write(&csv, "id,val\n1,10\n2,20\n").unwrap();
+        std::fs::write(&gpx, r#"<?xml version="1.0"?><gpx version="1.1"><wpt lat="10.0" lon="20.0"><name>W1</name></wpt></gpx>"#).unwrap();
+        std::fs::write(
+            &kml,
+            r#"<?xml version="1.0"?><kml xmlns="http://www.opengis.net/kml/2.2"><Placemark><Point><coordinates>20.0,10.0</coordinates></Point></Placemark></kml>"#,
+        )
+        .unwrap();
+        std::fs::write(&txt, "skip me").unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let mark = s.notices.len();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "convexHull",
+                    "folder": root.display().to_string(),
+                    "output_pattern": "{input}_out"
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["total"], 3);
+        let notices = &s.notices[mark..];
+        assert!(notices.iter().any(|n| n.text.contains("1 unsupported files skipped")));
 
         let _ = std::fs::remove_dir_all(root);
     }
