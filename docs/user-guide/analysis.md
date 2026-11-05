@@ -141,7 +141,7 @@ gp.batch={"tool":"buffer","inputs":["Cities","Rivers"],"output_pattern":"{input}
 
 Batch runs are fault-tolerant: a failed run on one input continues with the remaining items without aborting the batch. At completion, if any items fail, RustGIS emits a single aggregate failure notice without individual error reasons; inspect the returned `"errors"` array in the command result for each input and its reason.
 
-Batch runs targeting files or directories (using `folder` or `inputs` containing paths or file extensions such as `.shp`, `.gpkg`, or `.geojson`) require file access permissions (`Reach::Files`), prompting for confirmation in the AI Assistant and restricted in imported tasks. In contrast, batch runs over existing project layers (using layer names or `*`) execute entirely within the project and do not require file access permissions.
+Because `gp.batch` can read datasets from disk in the current working directory, all explicit `inputs` (layer names or file paths) and `folder` specifications are classified as file access (`Reach::Files`), requiring assistant confirmation and restricted in imported tasks without file permissions. Only the wildcard `inputs: "*"` operates purely on the active map's in-memory vector layers without file access.
 
 These are the built-in tools; GeoLibre and plugin tools join them when available.
 Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available tools and their parameters):

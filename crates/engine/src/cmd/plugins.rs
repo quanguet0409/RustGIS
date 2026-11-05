@@ -377,15 +377,10 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
         if params.get("folder").is_some() {
             return Some(Reach::Files);
         }
-        if let Some(inputs) = params.get("inputs") {
-            let has_file_input = match inputs {
-                Value::Array(a) => a.iter().any(|v| v.as_str().is_some_and(super::items::is_file_like_batch_input)),
-                Value::String(s) => !super::gp::is_wildcard_inputs(Some(inputs)) && super::items::is_file_like_batch_input(s),
-                _ => false,
-            };
-            if has_file_input {
-                return Some(Reach::Files);
-            }
+        if let Some(inputs) = params.get("inputs")
+            && !super::gp::is_wildcard_inputs(Some(inputs))
+        {
+            return Some(Reach::Files);
         }
         return super::items::names_place(params, PLACE_KEYS, 0).then_some(Reach::Files);
     }

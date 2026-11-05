@@ -2713,15 +2713,27 @@ mod file_permission_tests {
         let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_inputs));
         assert!(matches!(reaches, Some(crate::cmd::plugins::Reach::Files)));
 
+        // Non-wildcard inputs (including CSVs, bare names, and layer names) are classed as file access
+        // because reaches has no session to distinguish layer names from files in the working directory.
+        let p_csv = json!({"tool": "convexHull", "inputs": ["payroll.csv"]});
+        assert!(crate::cmd::items::touches_files("gp.batch", &p_csv));
+        let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_csv));
+        assert!(matches!(reaches, Some(crate::cmd::plugins::Reach::Files)));
+
+        let p_bare = json!({"tool": "convexHull", "inputs": ["notes"]});
+        assert!(crate::cmd::items::touches_files("gp.batch", &p_bare));
+        let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_bare));
+        assert!(matches!(reaches, Some(crate::cmd::plugins::Reach::Files)));
+
+        let p_layers = json!({"tool": "convexHull", "inputs": ["Cities", "Parks"]});
+        assert!(crate::cmd::items::touches_files("gp.batch", &p_layers));
+        let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_layers));
+        assert!(matches!(reaches, Some(crate::cmd::plugins::Reach::Files)));
+
+        // Only wildcard inputs '*' runs without file access (strictly over active map vector layers).
         let p_wildcard = json!({"tool": "convexHull", "inputs": "*"});
         assert!(!crate::cmd::items::touches_files("gp.batch", &p_wildcard));
         let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_wildcard));
-        assert!(reaches.is_none());
-
-        // Plain project layers do not touch files.
-        let p_layers = json!({"tool": "convexHull", "inputs": ["Cities", "Parks"]});
-        assert!(!crate::cmd::items::touches_files("gp.batch", &p_layers));
-        let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_layers));
         assert!(reaches.is_none());
 
         // Plain gp.run of merge on project layers does not touch files.

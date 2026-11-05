@@ -858,11 +858,7 @@ pub(crate) fn touches_files(command: &str, params: &Value) -> bool {
                 .is_some_and(|t| super::gp::writes_files(t) || super::gp::reads_files(t) || super::gp::is_geolibre_tool(t)))
         || (id == "gp.batch"
             && (params.get("folder").is_some()
-                || params.get("inputs").is_some_and(|inp| match inp {
-                    Value::Array(a) => a.iter().any(|v| v.as_str().is_some_and(is_file_like_batch_input)),
-                    Value::String(s) => !super::gp::is_wildcard_inputs(Some(inp)) && is_file_like_batch_input(s),
-                    _ => false,
-                })))
+                || (params.get("inputs").is_some() && !super::gp::is_wildcard_inputs(params.get("inputs")))))
         || reaches(params)
 }
 
@@ -908,18 +904,6 @@ pub(crate) fn looks_like_path(t: &str) -> bool {
         || t.contains("../")
         || t.contains("..\\")
         || (b.get(1) == Some(&b':') && b.first().is_some_and(u8::is_ascii_alphabetic))
-}
-
-/// Whether a batch input string looks like a file path, contains a path separator, or has a geospatial file extension.
-pub(crate) fn is_file_like_batch_input(t: &str) -> bool {
-    let t = t.trim();
-    looks_like_path(t)
-        || t.contains('/')
-        || t.contains('\\')
-        || matches!(
-            std::path::Path::new(t).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase().as_str(),
-            "shp" | "geojson" | "json" | "gpkg" | "fgb" | "parquet"
-        )
 }
 
 /// Whether parameters name a file, folder or address: a key in `keys` anywhere in them, or a
