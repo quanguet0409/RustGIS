@@ -1246,6 +1246,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     let mut distinct_tool_messages: Vec<(String, usize)> = Vec::new();
     let mut cancelled_after = None;
     let mut next_suffix: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    #[cfg(not(target_arch = "wasm32"))]
     let mut trimmed_paths = 0;
 
     for (i, target) in targets.iter().enumerate() {
@@ -1530,6 +1531,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         s.active_layer = active_before;
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     if trimmed_paths > 0 {
         s.notify(format!("gp.batch: {trimmed_paths} file path(s) trimmed of surrounding whitespace"), false);
     }
