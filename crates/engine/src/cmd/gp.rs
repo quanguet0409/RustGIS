@@ -1037,6 +1037,9 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     if base_params.get("output").is_some() {
         s.notify("params.output is ignored for batch runs; outputPattern determines output names", false);
     }
+    if base_params.get(batch_param).is_some() {
+        s.notify(format!("gp.batch: 'params.{batch_param}' is replaced by the batch inputs"), false);
+    }
 
     // Collect inputs: from "inputs" array or single string, wildcard "*", or "folder" directory path.
     let mut targets: Vec<String> = Vec::new();
@@ -3893,6 +3896,48 @@ mod batch_tests {
         assert!(
             !recent_clean.iter().any(|n| n.text.contains("unrecognised")),
             "clean call must not emit unrecognised option notice: {recent_clean:?}"
+        );
+    }
+
+    #[test]
+    fn batch_run_params_batch_param_overwritten_notified() {
+        let mut s = test_session();
+        let mark = s.notices.len() as u64;
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "params": {"input": "Parks", "distance": 10}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res["succeeded"], 1);
+        let recent = s.notices_since(mark);
+        assert!(
+            recent.iter().any(|n| n.text.contains("gp.batch: 'params.input' is replaced by the batch inputs")),
+            "recent notices: {recent:?}"
+        );
+
+        // Clean call without batch_param in params gives no replacement notice
+        let mut s_clean = test_session();
+        let mark_clean = s_clean.notices.len() as u64;
+        let res_clean = s_clean
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res_clean["succeeded"], 1);
+        let recent_clean = s_clean.notices_since(mark_clean);
+        assert!(
+            !recent_clean.iter().any(|n| n.text.contains("is replaced by the batch inputs")),
+            "clean call must not emit replacement notice: {recent_clean:?}"
         );
     }
 

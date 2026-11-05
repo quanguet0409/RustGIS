@@ -358,7 +358,7 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
     // External tools (the GeoLibre suite) run a native program that reads files a parameter
     // names, including bare file names.
     if (spec.id == "gp.run" || spec.id == "gp.batch")
-        && ps(params, "tool").and_then(rustgis_analysis::tool).is_some_and(super::gp::is_geolibre_tool)
+        && ps(params, "tool").and_then(super::gp::tool_id).and_then(rustgis_analysis::tool).is_some_and(super::gp::is_geolibre_tool)
     {
         return Some(Reach::Files);
     }
