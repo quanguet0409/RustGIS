@@ -1241,6 +1241,8 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 None
             }
         };
+        #[cfg(target_arch = "wasm32")]
+        let mut temp_layer_id: Option<u32> = None;
 
         let target_layer_name = {
             #[cfg(not(target_arch = "wasm32"))]
