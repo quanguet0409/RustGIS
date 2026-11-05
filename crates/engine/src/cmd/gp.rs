@@ -981,6 +981,18 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         s.notify("gp.batch: 'outputPattern' must be a string, ignoring invalid value", false);
     }
 
+    if let Value::Object(map) = p {
+        let recognized = ["tool", "param", "batch_param", "outputPattern", "output_pattern", "params", "inputs", "folder"];
+        let mut unknown_keys: Vec<&str> = map.keys().map(String::as_str).filter(|k| !recognized.contains(k)).collect();
+        if !unknown_keys.is_empty() {
+            unknown_keys.sort();
+            let count = unknown_keys.len();
+            let sample = unknown_keys.first().copied().unwrap_or_default();
+            let plural = if count == 1 { "option" } else { "options" };
+            s.notify(format!("gp.batch: {count} unrecognised {plural} ignored ({sample})"), false);
+        }
+    }
+
     // Identify which parameter to bind the input to.
     let batch_param = ps(p, "param").or_else(|| ps(p, "batch_param")).unwrap_or_else(|| {
         spec.params
@@ -2706,6 +2718,12 @@ mod file_permission_tests {
         let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_wildcard));
         assert!(reaches.is_none());
 
+        // Plain project layers do not touch files.
+        let p_layers = json!({"tool": "convexHull", "inputs": ["Cities", "Parks"]});
+        assert!(!crate::cmd::items::touches_files("gp.batch", &p_layers));
+        let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_layers));
+        assert!(reaches.is_none());
+
         // Plain gp.run of merge on project layers does not touch files.
         let p_run_merge = json!({"tool": "merge", "params": {"inputs": ["Cities", "Parks"]}});
         assert!(!crate::cmd::items::touches_files("gp.run", &p_run_merge));
@@ -3507,14 +3525,17 @@ mod batch_tests {
         std::fs::write(&f2, b"<xml></xml>").unwrap();
 
         let mut s = Session::new(crate::Project::default());
-        let _ = s.run(
-            "gp.batch",
-            &json!({
-                "tool": "convexHull",
-                "folder": root.display().to_string(),
-            }),
-        );
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "convexHull",
+                    "folder": root.display().to_string(),
+                }),
+            )
+            .unwrap();
 
+        assert_eq!(res["total"], 1);
         assert!(!s.notices.iter().any(|n| n.text.contains("unsupported files skipped")));
 
         let _ = std::fs::remove_dir_all(root);
@@ -3823,6 +3844,47 @@ mod batch_tests {
     }
 
     #[test]
+    fn batch_run_unrecognised_option_emits_notice() {
+        let mut s = test_session();
+        let mark = s.notices.len() as u64;
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "outputpattern": "{input}_out",
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res["succeeded"], 1);
+        let recent = s.notices_since(mark);
+        assert!(recent.iter().any(|n| n.text.contains("1 unrecognised option ignored (outputpattern)")), "recent notices: {recent:?}");
+
+        // Clean call emits no unrecognised option notice
+        let mut s_clean = test_session();
+        let mark_clean = s_clean.notices.len() as u64;
+        let res_clean = s_clean
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "outputPattern": "{input}_out",
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res_clean["succeeded"], 1);
+        let recent_clean = s_clean.notices_since(mark_clean);
+        assert!(
+            !recent_clean.iter().any(|n| n.text.contains("unrecognised")),
+            "clean call must not emit unrecognised option notice: {recent_clean:?}"
+        );
+    }
+
+    #[test]
     fn batch_run_failed_item_does_not_reserve_output_name() {
         let root = std::env::temp_dir().join(format!(
             "rustgis_batch_test_fail_name_{}",
@@ -3880,14 +3942,17 @@ mod batch_tests {
 
         let mut s = Session::new(crate::Project::default());
         let mark = s.notices.len();
-        let _ = s.run(
-            "gp.batch",
-            &json!({
-                "tool": "buffer",
-                "folder": root.display().to_string(),
-                "params": {"distance": 10}
-            }),
-        );
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "folder": root.display().to_string(),
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res["total"], 1);
         let notices = &s.notices[mark..];
         assert!(
             !notices.iter().any(|n| n.text.contains("unsupported files skipped")),
@@ -3897,14 +3962,17 @@ mod batch_tests {
         std::fs::write(root.join("notes.txt"), b"some notes").unwrap();
         let mut s2 = Session::new(crate::Project::default());
         let mark2 = s2.notices.len();
-        let _ = s2.run(
-            "gp.batch",
-            &json!({
-                "tool": "buffer",
-                "folder": root.display().to_string(),
-                "params": {"distance": 10}
-            }),
-        );
+        let res2 = s2
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "folder": root.display().to_string(),
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res2["total"], 1);
         let notices2 = &s2.notices[mark2..];
         assert!(
             notices2.iter().any(|n| n.text.contains("1 unsupported files skipped")),
