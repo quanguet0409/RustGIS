@@ -1198,6 +1198,10 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         return Err("folder batch runs are not supported in the browser; specify 'inputs' as an array of layers".into());
     }
 
+    if targets.is_empty() && is_wildcard {
+        return Err("'*' matched no vector layers on the active map; add a vector layer or name the inputs".into());
+    }
+
     if targets.is_empty() {
         return Err(
             "no inputs provided (specify 'inputs' as an array of layers/paths, '*' for all layers, or 'folder' as a directory path)".into(),
@@ -4656,5 +4660,19 @@ mod batch_tests {
         assert_eq!(s.active_layer, Some(1), "active layer must remain Parks after calculateGeometry");
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_wildcard_on_empty_map_returns_specific_error() {
+        let mut s = Session::new(crate::Project::default());
+        let res = s.run(
+            "gp.batch",
+            &json!({
+                "tool": "buffer",
+                "inputs": "*",
+                "params": {"distance": 10}
+            }),
+        );
+        assert_eq!(res.unwrap_err(), "'*' matched no vector layers on the active map; add a vector layer or name the inputs");
     }
 }
