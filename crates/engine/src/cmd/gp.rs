@@ -1036,7 +1036,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         }
         None => json!({}),
     };
-    if base_params.get("output").is_some_and(|v| !v.is_null()) {
+    if tool_has_output && base_params.get("output").is_some_and(|v| !v.is_null()) {
         s.notify("params.output is ignored for batch runs; outputPattern determines output names", false);
     }
     if base_params.get(batch_param).is_some_and(|v| !v.is_null()) {
@@ -1436,9 +1436,9 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(lid) = temp_layer_id {
                         layer_ids.push(lid);
+                        seen_outputs.insert(target_layer_name.clone());
+                        output_names.push(target_layer_name.clone());
                     }
-                    seen_outputs.insert(target_layer_name.clone());
-                    output_names.push(target_layer_name.clone());
                 } else {
                     succeeded.pop();
                     let err = messages.last().cloned().unwrap_or_else(|| "tool produced no output".into());
@@ -4051,6 +4051,65 @@ mod batch_tests {
         assert_eq!(replay_res["succeeded"], 1);
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_selection_tool_on_map_layer_outputs_empty() {
+        let mut s = Session::new(crate::Project::default());
+        let mut ds = Dataset::new(
+            "Cities",
+            rustgis_data::GeometryType::Point,
+            vec![rustgis_data::Field::new("pop", rustgis_data::FieldType::Integer)],
+        );
+        ds.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(10.0, 20.0))), vec![rustgis_data::Value::Int(100)]);
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, ds));
+
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "selectByAttributes",
+                    "inputs": ["Cities"],
+                    "params": {"where": "pop > 50"}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let outputs = res["outputs"].as_array().unwrap();
+        assert!(outputs.is_empty(), "selection on existing map layer must not report layer as an output: {outputs:?}");
+        assert_eq!(s.map().layer_by_name("Cities").unwrap().selection.len(), 1);
+    }
+
+    #[test]
+    fn batch_run_tool_without_output_param_set_emits_no_ignored_notice() {
+        let mut s = Session::new(crate::Project::default());
+        let mut ds = Dataset::new(
+            "Cities",
+            rustgis_data::GeometryType::Point,
+            vec![rustgis_data::Field::new("pop", rustgis_data::FieldType::Integer)],
+        );
+        ds.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(10.0, 20.0))), vec![rustgis_data::Value::Int(100)]);
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, ds));
+
+        let mark = s.notices.len();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "summaryStatistics",
+                    "inputs": ["Cities"],
+                    "params": {"field": "pop", "output": "ignored_or_passthrough"}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let notices = &s.notices[mark..];
+        assert!(
+            !notices.iter().any(|n| n.text.contains("params.output is ignored")),
+            "tool without output param must not emit 'params.output is ignored' notice: {notices:?}"
+        );
     }
 
     #[test]

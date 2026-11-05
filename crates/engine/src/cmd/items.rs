@@ -884,11 +884,26 @@ pub(crate) fn layer_name_left_out<'a>(command: &str, params: &'a Value) -> std::
     // Copied only when there is a name to leave out: other commands' parameters (a file's
     // contents, say) are read as they are.
     if command == "gp.batch" {
-        if params.pointer("/params/output").is_some() {
-            let mut out = params.clone();
-            if let Some(p) = out.get_mut("params").and_then(Value::as_object_mut) {
-                p.remove("output");
-            }
+        let mut out = params.clone();
+        let mut modified = false;
+        if let Some(p) = out.get_mut("params").and_then(Value::as_object_mut)
+            && p.remove("output").is_some()
+        {
+            modified = true;
+        }
+        if out.get("folder").is_some_and(Value::is_null)
+            && let Some(obj) = out.as_object_mut()
+        {
+            obj.remove("folder");
+            modified = true;
+        }
+        if out.get("inputs").is_some_and(Value::is_null)
+            && let Some(obj) = out.as_object_mut()
+        {
+            obj.remove("inputs");
+            modified = true;
+        }
+        if modified {
             return Cow::Owned(out);
         }
         return Cow::Borrowed(params);
@@ -921,7 +936,7 @@ pub(crate) fn looks_like_path(t: &str) -> bool {
 pub(crate) fn names_place(v: &Value, keys: &[&str], depth: usize) -> bool {
     match v {
         Value::Object(o) if depth < 16 => {
-            o.iter().any(|(k, v)| (!v.is_null() && keys.contains(&k.to_ascii_lowercase().as_str())) || names_place(v, keys, depth + 1))
+            o.iter().any(|(k, v)| keys.contains(&k.to_ascii_lowercase().as_str()) || names_place(v, keys, depth + 1))
         }
         Value::Array(a) if depth < 16 => a.iter().any(|v| names_place(v, keys, depth + 1)),
         Value::Object(_) | Value::Array(_) => true,
