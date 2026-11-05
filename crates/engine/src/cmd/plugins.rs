@@ -382,7 +382,8 @@ pub fn reaches(spec: &C, params: &Value) -> Option<Reach> {
         {
             return Some(Reach::Files);
         }
-        return super::items::names_place(params, PLACE_KEYS, 0).then_some(Reach::Files);
+        let stripped = super::items::layer_name_left_out(spec.id, params);
+        return super::items::names_place(&stripped, PLACE_KEYS, 0).then_some(Reach::Files);
     }
     // A catalog's Zarr entry is opened as `layer.addZarr` is, a database's way.
     if spec.id == "cube.open" && super::cube_catalog::opens_zarr(params) {

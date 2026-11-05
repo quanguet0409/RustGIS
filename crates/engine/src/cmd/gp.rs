@@ -1441,7 +1441,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     output_names.push(target_layer_name.clone());
                 } else {
                     succeeded.pop();
-                    let err = item_msg.unwrap_or_else(|| "tool produced no output".into());
+                    let err = messages.last().cloned().unwrap_or_else(|| "tool produced no output".into());
                     if let Some(last) = s.project.gp_history.last_mut() {
                         last.ok = false;
                         if !last.messages.contains(&err) {
@@ -1449,7 +1449,11 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                         }
                     }
                     failed.push(json!({"input": target, "error": err.clone()}));
-                    errors.push(json!({"input": target, "error": err}));
+                    let mut err_obj = json!({"input": target, "error": err});
+                    if messages.len() > 1 {
+                        err_obj["messages"] = json!(messages);
+                    }
+                    errors.push(err_obj);
                     #[cfg(not(target_arch = "wasm32"))]
                     if let Some(temp_id) = temp_layer_id.take() {
                         super::layer::drop_layers(s, &[temp_id]);
@@ -2813,6 +2817,12 @@ mod file_permission_tests {
         let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_null_folder_wildcard));
         assert!(reaches.is_none());
 
+        // Wildcard batch with params.output is ignored by gp.batch and does not touch files.
+        let p_wildcard_output = json!({"tool": "convexHull", "inputs": "*", "params": {"output": "Roads"}});
+        assert!(!crate::cmd::items::touches_files("gp.batch", &p_wildcard_output));
+        let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_wildcard_output));
+        assert!(reaches.is_none());
+
         // Plain gp.run of merge on project layers does not touch files.
         let p_run_merge = json!({"tool": "merge", "params": {"inputs": ["Cities", "Parks"]}});
         assert!(!crate::cmd::items::touches_files("gp.run", &p_run_merge));
@@ -3746,6 +3756,65 @@ mod batch_tests {
         let outputs = res["outputs"].as_array().unwrap();
         assert!(outputs.is_empty(), "must not emit phantom output name");
         assert!(s.notices[mark..].iter().any(|n| n.text.contains("1 failed (L1)")));
+    }
+
+    fn empty_output_multi_message_runner(
+        _spec: &rustgis_analysis::ToolSpec,
+        _inputs: &dyn rustgis_analysis::Inputs,
+        _params: &serde_json::Value,
+    ) -> Result<rustgis_analysis::ToolResult, String> {
+        Ok(rustgis_analysis::ToolResult {
+            output: rustgis_analysis::Output::Layers(Vec::new()),
+            messages: vec!["Processed 10 features".to_string(), "0 features matched criteria".to_string()],
+        })
+    }
+
+    #[test]
+    fn batch_run_tool_producing_no_output_takes_last_message_as_error() {
+        rustgis_analysis::register_external(
+            "test_empty_output_multi_msg_suite",
+            || {
+                vec![rustgis_analysis::ToolSpec {
+                    id: "test:empty_output_multi_msg",
+                    name: "Empty Output Multi Message Tool",
+                    toolbox: "Test",
+                    summary: "",
+                    params: &[rustgis_analysis::ParamSpec {
+                        name: "input",
+                        label: "Input Layer",
+                        kind: rustgis_analysis::ParamKind::Layer,
+                        required: true,
+                        default: "",
+                        help: "",
+                    }],
+                    run: rustgis_analysis::external_placeholder,
+                }]
+            },
+            empty_output_multi_message_runner,
+        );
+
+        let mut s = Session::new(crate::Project::default());
+        let ds = Dataset::new("L1", rustgis_data::GeometryType::Point, Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, ds));
+
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "test:empty_output_multi_msg",
+                    "inputs": ["L1"],
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["failed"], 1);
+        let errs = res["errors"].as_array().unwrap();
+        assert_eq!(errs.len(), 1);
+        assert_eq!(errs[0]["error"], "0 features matched criteria");
+        let msgs = errs[0]["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0], "Processed 10 features");
+        assert_eq!(msgs[1], "0 features matched criteria");
     }
 
     #[test]

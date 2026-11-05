@@ -883,6 +883,16 @@ pub(crate) fn layer_name_left_out<'a>(command: &str, params: &'a Value) -> std::
     let named = || params.pointer("/params/output").and_then(Value::as_str).is_some_and(plain);
     // Copied only when there is a name to leave out: other commands' parameters (a file's
     // contents, say) are read as they are.
+    if command == "gp.batch" {
+        if params.pointer("/params/output").is_some() {
+            let mut out = params.clone();
+            if let Some(p) = out.get_mut("params").and_then(Value::as_object_mut) {
+                p.remove("output");
+            }
+            return Cow::Owned(out);
+        }
+        return Cow::Borrowed(params);
+    }
     if command != "gp.run" || !built_in() || !named() {
         return Cow::Borrowed(params);
     }
