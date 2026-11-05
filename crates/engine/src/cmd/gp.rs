@@ -1004,10 +1004,6 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         s.notify("params.output is ignored for batch runs; outputPattern determines output names", false);
     }
 
-    if p.get("inputs").is_some() && p.get("folder").is_some() {
-        s.notify("both 'inputs' and 'folder' were provided; running 'inputs' and ignoring 'folder'", false);
-    }
-
     // Collect inputs: from "inputs" array or single string, wildcard "*", or "folder" directory path.
     let mut targets: Vec<String> = Vec::new();
     let mut dropped_inputs = 0;
@@ -1047,6 +1043,10 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
 
     if dropped_inputs > 0 {
         s.notify(format!("gp.batch: {dropped_inputs} invalid input(s) skipped (not a valid layer name or file path)"), false);
+    }
+
+    if p.get("folder").is_some() && !targets.is_empty() {
+        s.notify("both 'inputs' and 'folder' were provided; running 'inputs' and ignoring 'folder'", false);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -1111,6 +1111,9 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     let mut layer_ids = Vec::new();
     let mut output_names = Vec::new();
     let mut seen_outputs = std::collections::HashSet::new();
+    let mut collisions = 0;
+    let mut first_collision = None;
+    let mut read_messages = Vec::new();
 
     for (i, target) in targets.iter().enumerate() {
         if control.is_cancelled() {
@@ -1120,6 +1123,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
 
         let base_name = match s.map().layer_by_name(target) {
             Some(layer) => layer.name.as_str(),
+            None if crate::project::find_table(&s.project.tables, target).is_some() => target.as_str(),
             None => std::path::Path::new(target).file_stem().and_then(|stem| stem.to_str()).unwrap_or(target),
         };
         let out_name = pattern.replace("{input}", base_name).replace("{tool}", tool_id);
@@ -1131,7 +1135,10 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 final_out_name = format!("{stem}_{counter}");
                 counter += 1;
             }
-            s.notify(format!("output name '{out_name}' collided; renamed to '{final_out_name}'"), false);
+            collisions += 1;
+            if first_collision.is_none() {
+                first_collision = Some(format!("'{out_name}' → '{final_out_name}'"));
+            }
         }
         seen_outputs.insert(final_out_name.clone());
 
@@ -1141,7 +1148,12 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             if s.map().layer_by_name(target).is_none() && crate::project::find_table(&s.project.tables, target).is_none() && path.is_file()
             {
                 match rustgis_data::io::read_path(path) {
-                    Ok((dataset, _report)) => Some(super::layer::add_dataset(s, dataset)),
+                    Ok((dataset, report)) => {
+                        for msg in report.messages {
+                            read_messages.push(format!("{target}: {msg}"));
+                        }
+                        Some(super::layer::add_dataset(s, dataset))
+                    }
                     Err(e) => {
                         failed.push(json!({"input": target, "error": e.to_string()}));
                         control.advance(1);
@@ -1174,13 +1186,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             map.insert("output".to_string(), json!(final_out_name));
         }
 
-        let item_control =
-            if s.stoppable { rustgis_analysis::control::Control::stoppable() } else { rustgis_analysis::control::Control::new() };
-        if control.is_cancelled() {
-            item_control.cancel();
-        }
-
-        match run_tool_with(s, tool_id, &item_params, &item_control) {
+        match run_tool_with(s, tool_id, &item_params, control) {
             Ok(res) => {
                 succeeded.push(target.clone());
                 let actual_name = if let Some(lid) = res.get("layer").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()) {
@@ -1218,7 +1224,18 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             }
         }
 
-        control.advance(1);
+        control.begin(targets.len() as u64);
+        control.advance((i + 1) as u64);
+    }
+
+    if collisions > 0 {
+        let first = first_collision.unwrap_or_default();
+        s.notify(format!("gp.batch: {collisions} output name(s) collided and were renamed (first: {first})"), false);
+    }
+
+    if !read_messages.is_empty() {
+        let first = &read_messages[0];
+        s.notify(format!("gp.batch: {} notice(s) reading inputs (first: {first})", read_messages.len()), false);
     }
 
     if !failed.is_empty() {
@@ -2753,5 +2770,83 @@ mod batch_tests {
         assert!(s.map().layer_by_name(outputs[0].as_str().unwrap()).is_some());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_cancelled_stops_remaining_items() {
+        let mut s = test_session();
+        let control = rustgis_analysis::control::Control::new();
+        control.cancel();
+        let res = run_batch_with(
+            &mut s,
+            &json!({
+                "tool": "buffer",
+                "inputs": ["Cities", "Parks"],
+                "params": {"distance": 10}
+            }),
+            &control,
+        )
+        .unwrap();
+
+        assert_eq!(res["total"], 2);
+        assert_eq!(res["succeeded"], 0);
+        assert!(s.notices.iter().any(|n| n.text.contains("was cancelled")));
+    }
+
+    #[test]
+    fn batch_run_empty_inputs_with_folder_no_bogus_notice() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_empty_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let f1 = root.join("layer.geojson");
+        let sample_geojson = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1.0,2.0]},"properties":{}}]}"#;
+        std::fs::write(&f1, sample_geojson).unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let mark = s.notices.len();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "convexHull",
+                    "inputs": [],
+                    "folder": root.display().to_string()
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let notices = &s.notices[mark..];
+        assert!(!notices.iter().any(|n| n.text.contains("both 'inputs' and 'folder'")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_aggregated_collision_notice() {
+        let mut s = test_session();
+        let pre1 = Dataset::new("Cities_buffer", rustgis_data::GeometryType::Point, Vec::new());
+        let pre2 = Dataset::new("Cities_buffer_2", rustgis_data::GeometryType::Point, Vec::new());
+        s.map_mut().add_layer(rustgis_map::Layer::new(10, pre1));
+        s.map_mut().add_layer(rustgis_map::Layer::new(11, pre2));
+
+        let mark = s.notices.len();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let notices = &s.notices[mark..];
+        assert!(notices.iter().any(|n| n.text.contains("1 output name(s) collided and were renamed")));
     }
 }
