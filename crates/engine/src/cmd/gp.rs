@@ -1269,7 +1269,6 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         #[cfg(not(target_arch = "wasm32"))]
         let mut res_was_selected = false;
 
-        let prior_tables = s.project.tables.clone();
         match run_tool_quiet(s, tool_id, &item_params, control) {
             Ok((res, messages)) => {
                 succeeded.push(target.clone());
@@ -1315,30 +1314,14 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                         }
                     }
                 } else if let Some(table) = res.get("table").and_then(Value::as_str) {
-                    let mut final_table = table.to_string();
-                    let had_prior = prior_tables.into_iter().find(|t| t.name == table);
-                    if had_prior.is_some() || seen_outputs.contains(&final_table) {
-                        let stem = table.to_string();
-                        let mut counter = 2;
-                        final_table = format!("{stem}_{counter}");
-                        while seen_outputs.contains(&final_table) || s.project.tables.iter().any(|t| t.name == final_table) {
-                            counter += 1;
-                            final_table = format!("{stem}_{counter}");
-                        }
-                        if let Some(t) = s.project.tables.iter_mut().find(|t| t.name == table) {
-                            t.name.clone_from(&final_table);
-                            t.dataset.name.clone_from(&final_table);
-                        }
-                        if let Some(prior_t) = had_prior {
-                            s.project.tables.push(prior_t);
-                        }
+                    if table != format!("{target}_Statistics") {
                         collisions += 1;
                         if first_collision.is_none() {
-                            first_collision = Some(format!("'{table}' → '{final_table}'"));
+                            first_collision = Some(format!("'{target}_Statistics' → '{table}'"));
                         }
                     }
-                    seen_outputs.insert(final_table.clone());
-                    output_names.push(final_table);
+                    seen_outputs.insert(table.to_string());
+                    output_names.push(table.to_string());
                 } else if item_was_selected {
                     seen_outputs.insert(target_layer_name.clone());
                     output_names.push(target_layer_name.clone());
@@ -1505,7 +1488,7 @@ pub fn run_tool_with(
     params: &Value,
     control: &std::sync::Arc<rustgis_analysis::control::Control>,
 ) -> CmdResult {
-    run_tool_internal(s, tool, params, control, true).map(|(v, _)| v)
+    run_tool_internal(s, tool, params, control, true, true).map(|(v, _)| v)
 }
 
 /// Runs a geoprocessing tool quietly without forwarding intermediate notices to the session.
@@ -1515,7 +1498,7 @@ pub(crate) fn run_tool_quiet(
     params: &Value,
     control: &std::sync::Arc<rustgis_analysis::control::Control>,
 ) -> Result<(Value, Vec<String>), String> {
-    run_tool_internal(s, tool, params, control, false)
+    run_tool_internal(s, tool, params, control, false, false)
 }
 
 /// Internal runner for geoprocessing tools, executing the tool and capturing outputs and notices.
@@ -1525,6 +1508,7 @@ fn run_tool_internal(
     params: &Value,
     control: &std::sync::Arc<rustgis_analysis::control::Control>,
     notify_messages: bool,
+    replace_tables: bool,
 ) -> Result<(Value, Vec<String>), String> {
     let tool = tool_id(tool).unwrap_or(tool).to_string();
     let params = params.clone();
@@ -1533,7 +1517,15 @@ fn run_tool_internal(
         let spec = rustgis_analysis::tool(&tool);
         let name = spec.map(|t| t.name).unwrap_or("Tool").to_string();
         let e = format!("{name} was cancelled before it started");
-        return apply_inner(s, Ran { name, id: tool, command: None, started: t0 }, recorded(spec, params), Err(e), 0, notify_messages);
+        return apply_inner(
+            s,
+            Ran { name, id: tool, command: None, started: t0 },
+            recorded(spec, params),
+            Err(e),
+            0,
+            notify_messages,
+            replace_tables,
+        );
     }
     let inputs = map_inputs(s, rustgis_analysis::tool(&tool), &params)?;
     let mut res = rustgis_analysis::run_with(&tool, &inputs, &params, control);
@@ -1546,7 +1538,7 @@ fn run_tool_internal(
     let millis = now_ms().saturating_sub(t0);
     let spec = rustgis_analysis::tool(&tool);
     let name = spec.map(|t| t.name).unwrap_or("Tool").to_string();
-    apply_inner(s, Ran { name, id: tool, command: None, started: t0 }, recorded(spec, params), res, millis, notify_messages)
+    apply_inner(s, Ran { name, id: tool, command: None, started: t0 }, recorded(spec, params), res, millis, notify_messages, replace_tables)
 }
 
 /// Whether a tool can read files named by a path or vector-layer-list parameter.
@@ -1693,7 +1685,7 @@ fn names_file(source: &str, destination: &std::path::Path) -> bool {
 
 /// Adds a tool's result to the map and the history.
 fn apply(s: &mut Session, ran: Ran, params: Value, res: Result<rustgis_analysis::ToolResult, String>, millis: u64) -> CmdResult {
-    apply_inner(s, ran, params, res, millis, true).map(|(v, _)| v)
+    apply_inner(s, ran, params, res, millis, true, true).map(|(v, _)| v)
 }
 
 /// Adds a tool's result to the map and history, optionally notifying messages to the session.
@@ -1704,6 +1696,7 @@ fn apply_inner(
     res: Result<rustgis_analysis::ToolResult, String>,
     millis: u64,
     notify_messages: bool,
+    replace_tables: bool,
 ) -> Result<(Value, Vec<String>), String> {
     let Ran { name, id, command, started } = ran;
     let at = started / 1000;
@@ -1778,9 +1771,22 @@ fn apply_inner(
             l.touch_geometry();
             json!({"updated": layer})
         }
-        Output::Table(t) => {
+        Output::Table(mut t) => {
+            if !replace_tables && s.project.tables.iter().any(|existing| existing.name == t.name) {
+                let stem = t.name.clone();
+                let mut counter = 2;
+                while s.project.tables.iter().any(|existing| existing.name == format!("{stem}_{counter}")) {
+                    counter += 1;
+                }
+                let new_name = format!("{stem}_{counter}");
+                t.name = new_name;
+            }
             let n = t.name.clone();
-            s.project.put_table(t);
+            if replace_tables {
+                s.project.put_table(t);
+            } else {
+                s.project.add_table(t);
+            }
             json!({"table": n})
         }
         Output::Layers(outputs) => {
@@ -1803,9 +1809,22 @@ fn apply_inner(
                             Err(e) => result.messages.push(e),
                         }
                     }
-                    OutputLayer::Table(t) => {
+                    OutputLayer::Table(mut t) => {
+                        if !replace_tables && s.project.tables.iter().any(|existing| existing.name == t.name) {
+                            let stem = t.name.clone();
+                            let mut counter = 2;
+                            while s.project.tables.iter().any(|existing| existing.name == format!("{stem}_{counter}")) {
+                                counter += 1;
+                            }
+                            let new_name = format!("{stem}_{counter}");
+                            t.name = new_name;
+                        }
                         let n = t.name.clone();
-                        s.project.put_table(t);
+                        if replace_tables {
+                            s.project.put_table(t);
+                        } else {
+                            s.project.add_table(t);
+                        }
                         tables.push(n);
                     }
                 }
@@ -2993,6 +3012,8 @@ mod batch_tests {
         assert_eq!(outputs[0], "Cities_Statistics_2");
         assert!(crate::project::find_table(&s.project.tables, "Cities_Statistics").is_some());
         assert!(crate::project::find_table(&s.project.tables, "Cities_Statistics_2").is_some());
+        let ids: std::collections::HashSet<u32> = s.project.tables.iter().map(|t| t.id).collect();
+        assert_eq!(ids.len(), s.project.tables.len(), "all table ids must be distinct");
         assert!(s.notices.iter().any(|n| n.text.contains("output name(s) collided and were renamed")));
     }
 
@@ -3025,6 +3046,8 @@ mod batch_tests {
         assert_eq!(outputs[1], "Cities_Statistics_2");
         assert!(crate::project::find_table(&s.project.tables, "Cities_Statistics").is_some());
         assert!(crate::project::find_table(&s.project.tables, "Cities_Statistics_2").is_some());
+        let ids: std::collections::HashSet<u32> = s.project.tables.iter().map(|t| t.id).collect();
+        assert_eq!(ids.len(), s.project.tables.len(), "all table ids must be distinct");
     }
 
     #[test]
