@@ -1202,22 +1202,25 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             None if crate::project::find_table(&s.project.tables, target).is_some() => target.as_str(),
             None => std::path::Path::new(target).file_stem().and_then(|stem| stem.to_str()).unwrap_or(target),
         };
+        let tool_has_output = spec.params.iter().any(|param| param.name == "output");
         let out_name = pattern.replace("{input}", base_name).replace("{tool}", tool_id);
         let mut final_out_name = out_name.clone();
         let mut had_collision = false;
-        let collision_exists = |name: &str| {
-            seen_outputs.contains(name)
-                || s.map().layer_by_name(name).is_some()
-                || crate::project::find_table(&s.project.tables, name).is_some()
-        };
-        if collision_exists(&final_out_name) {
-            let stem = final_out_name.clone();
-            let mut counter = 2;
-            while collision_exists(&final_out_name) {
-                final_out_name = format!("{stem}_{counter}");
-                counter += 1;
+        if tool_has_output {
+            let collision_exists = |name: &str| {
+                seen_outputs.contains(name)
+                    || s.map().layer_by_name(name).is_some()
+                    || crate::project::find_table(&s.project.tables, name).is_some()
+            };
+            if collision_exists(&final_out_name) {
+                let stem = final_out_name.clone();
+                let mut counter = 2;
+                while collision_exists(&final_out_name) {
+                    final_out_name = format!("{stem}_{counter}");
+                    counter += 1;
+                }
+                had_collision = true;
             }
-            had_collision = true;
         }
 
         let active_before = s.active_layer;
@@ -1281,7 +1284,6 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                         first_collision = Some(format!("'{out_name}' → '{final_out_name}'"));
                     }
                 }
-                seen_outputs.insert(final_out_name.clone());
 
                 let item_was_selected = res.get("selected").is_some();
                 #[cfg(not(target_arch = "wasm32"))]
@@ -1289,12 +1291,16 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     res_was_selected = item_was_selected;
                 }
 
+                let mut produced_output = false;
+
                 if let Some(lid) = res.get("layer").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok()) {
                     layer_ids.push(lid);
                     let actual_name = s.map().layer(lid).map(|l| l.name.clone()).unwrap_or_else(|| final_out_name.clone());
                     seen_outputs.insert(actual_name.clone());
                     output_names.push(actual_name);
-                } else if let Some(upd) = res.get("updated").and_then(Value::as_str) {
+                    produced_output = true;
+                }
+                if let Some(upd) = res.get("updated").and_then(Value::as_str) {
                     if let Some(l) = s.map().layer_by_name(upd) {
                         layer_ids.push(l.id);
                         seen_outputs.insert(l.name.clone());
@@ -1303,30 +1309,58 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                         seen_outputs.insert(upd.to_string());
                         output_names.push(upd.to_string());
                     }
-                } else if let Some(lids) = res.get("layers").and_then(Value::as_array) {
+                    produced_output = true;
+                }
+                if let Some(lids) = res.get("layers").and_then(Value::as_array) {
                     for l in lids {
                         if let Some(lid) = l.as_u64().and_then(|id| u32::try_from(id).ok()) {
                             layer_ids.push(lid);
                             if let Some(layer) = s.map().layer(lid) {
                                 seen_outputs.insert(layer.name.clone());
                                 output_names.push(layer.name.clone());
+                                produced_output = true;
                             }
                         }
                     }
-                } else if let Some(table) = res.get("table").and_then(Value::as_str) {
-                    if table != format!("{target}_Statistics") {
+                }
+                if let Some(table) = res.get("table").and_then(Value::as_str) {
+                    if let Some(orig) = res.get("table_renamed_from").and_then(Value::as_str) {
                         collisions += 1;
                         if first_collision.is_none() {
-                            first_collision = Some(format!("'{target}_Statistics' → '{table}'"));
+                            first_collision = Some(format!("'{orig}' → '{table}'"));
                         }
                     }
                     seen_outputs.insert(table.to_string());
                     output_names.push(table.to_string());
-                } else if item_was_selected {
-                    seen_outputs.insert(target_layer_name.clone());
-                    output_names.push(target_layer_name.clone());
-                } else {
-                    output_names.push(final_out_name);
+                    produced_output = true;
+                }
+                if let Some(tables) = res.get("tables").and_then(Value::as_array) {
+                    for t in tables {
+                        if let Some(table) = t.as_str() {
+                            seen_outputs.insert(table.to_string());
+                            output_names.push(table.to_string());
+                            produced_output = true;
+                        }
+                    }
+                }
+                if let Some(renamed_list) = res.get("tables_renamed").and_then(Value::as_array) {
+                    for item in renamed_list {
+                        if let (Some(orig), Some(to)) = (item.get("from").and_then(Value::as_str), item.get("to").and_then(Value::as_str)) {
+                            collisions += 1;
+                            if first_collision.is_none() {
+                                first_collision = Some(format!("'{orig}' → '{to}'"));
+                            }
+                        }
+                    }
+                }
+                if !produced_output {
+                    if item_was_selected {
+                        seen_outputs.insert(target_layer_name.clone());
+                        output_names.push(target_layer_name.clone());
+                    } else {
+                        seen_outputs.insert(final_out_name.clone());
+                        output_names.push(final_out_name);
+                    }
                 }
             }
             Err(err) => {
@@ -1772,6 +1806,7 @@ fn apply_inner(
             json!({"updated": layer})
         }
         Output::Table(mut t) => {
+            let mut renamed_from = None;
             if !replace_tables && s.project.tables.iter().any(|existing| existing.name == t.name) {
                 let stem = t.name.clone();
                 let mut counter = 2;
@@ -1779,7 +1814,7 @@ fn apply_inner(
                     counter += 1;
                 }
                 let new_name = format!("{stem}_{counter}");
-                t.name = new_name;
+                renamed_from = Some(std::mem::replace(&mut t.name, new_name));
             }
             let n = t.name.clone();
             if replace_tables {
@@ -1787,11 +1822,12 @@ fn apply_inner(
             } else {
                 s.project.add_table(t);
             }
-            json!({"table": n})
+            if let Some(orig) = renamed_from { json!({"table": n, "table_renamed_from": orig}) } else { json!({"table": n}) }
         }
         Output::Layers(outputs) => {
             let mut layers = Vec::new();
             let mut tables = Vec::new();
+            let mut tables_renamed = Vec::new();
             for o in outputs {
                 match o {
                     OutputLayer::Vector(ds) => layers.push(super::layer::add_dataset(s, ds)),
@@ -1810,6 +1846,7 @@ fn apply_inner(
                         }
                     }
                     OutputLayer::Table(mut t) => {
+                        let mut renamed_from = None;
                         if !replace_tables && s.project.tables.iter().any(|existing| existing.name == t.name) {
                             let stem = t.name.clone();
                             let mut counter = 2;
@@ -1817,7 +1854,7 @@ fn apply_inner(
                                 counter += 1;
                             }
                             let new_name = format!("{stem}_{counter}");
-                            t.name = new_name;
+                            renamed_from = Some(std::mem::replace(&mut t.name, new_name));
                         }
                         let n = t.name.clone();
                         if replace_tables {
@@ -1825,11 +1862,18 @@ fn apply_inner(
                         } else {
                             s.project.add_table(t);
                         }
-                        tables.push(n);
+                        tables.push(n.clone());
+                        if let Some(orig) = renamed_from {
+                            tables_renamed.push(json!({"from": orig, "to": n}));
+                        }
                     }
                 }
             }
-            json!({"layers": layers, "tables": tables})
+            let mut ret = json!({"layers": layers, "tables": tables});
+            if !tables_renamed.is_empty() {
+                ret["tables_renamed"] = json!(tables_renamed);
+            }
+            ret
         }
     };
     let messages = result.messages.clone();
@@ -3048,6 +3092,101 @@ mod batch_tests {
         assert!(crate::project::find_table(&s.project.tables, "Cities_Statistics_2").is_some());
         let ids: std::collections::HashSet<u32> = s.project.tables.iter().map(|t| t.id).collect();
         assert_eq!(ids.len(), s.project.tables.len(), "all table ids must be distinct");
+        assert!(s.notices.iter().any(|n| n.text.contains("output name(s) collided and were renamed")));
+    }
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn batch_run_table_file_input_no_false_collision_notice() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_file_stat_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("cities.geojson");
+        std::fs::write(&path, r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[10.0,20.0]},"properties":{"pop":100}}]}"#).unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "summaryStatistics",
+                    "inputs": [path.to_str().unwrap()],
+                    "params": {"field": "pop"}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let outputs = res["outputs"].as_array().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0], "cities_Statistics");
+        assert!(crate::project::find_table(&s.project.tables, "cities_Statistics").is_some());
+        assert!(
+            !s.notices.iter().any(|n| n.text.contains("output name(s) collided and were renamed")),
+            "file-input summaryStatistics must not emit false collision notice"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_output_layers_only_table_collected() {
+        rustgis_analysis::register_external(
+            "test_output_layers_table_suite",
+            || {
+                vec![rustgis_analysis::ToolSpec {
+                    id: "test:table_only",
+                    name: "Table Only Tool",
+                    toolbox: "Test",
+                    summary: "",
+                    params: &[rustgis_analysis::ParamSpec {
+                        name: "input",
+                        label: "Input Layer",
+                        kind: rustgis_analysis::ParamKind::Layer,
+                        required: true,
+                        default: "",
+                        help: "",
+                    }],
+                    run: rustgis_analysis::external_placeholder,
+                }]
+            },
+            |_spec, _inputs, _params| {
+                let table = Dataset::new(
+                    "CustomPluginTable",
+                    rustgis_data::GeometryType::None,
+                    vec![rustgis_data::Field::new("col", rustgis_data::FieldType::Integer)],
+                );
+                Ok(rustgis_analysis::ToolResult {
+                    output: rustgis_analysis::Output::Layers(vec![rustgis_analysis::OutputLayer::Table(table)]),
+                    messages: Vec::new(),
+                })
+            },
+        );
+
+        let mut s = Session::new(crate::Project::default());
+        let ds = Dataset::new(
+            "InputLayer",
+            rustgis_data::GeometryType::Point,
+            vec![rustgis_data::Field::new("val", rustgis_data::FieldType::Integer)],
+        );
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, ds));
+
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "test:table_only",
+                    "inputs": ["InputLayer"],
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let outputs = res["outputs"].as_array().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0], "CustomPluginTable");
+        assert!(crate::project::find_table(&s.project.tables, "CustomPluginTable").is_some());
     }
 
     #[test]
