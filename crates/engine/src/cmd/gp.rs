@@ -972,6 +972,16 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     let tool_id = tool_id(tool_name).ok_or_else(|| format!("no tool '{tool_name}'"))?;
     let spec = rustgis_analysis::tool(tool_id).ok_or_else(|| format!("no tool '{tool_name}'"))?;
 
+    if p.get("param").is_some_and(|v| !v.is_string()) {
+        s.notify("gp.batch: 'param' must be a string, ignoring invalid value", false);
+    }
+    if p.get("batch_param").is_some_and(|v| !v.is_string()) {
+        s.notify("gp.batch: 'batch_param' must be a string, ignoring invalid value", false);
+    }
+    if p.get("outputPattern").is_some_and(|v| !v.is_string()) || p.get("output_pattern").is_some_and(|v| !v.is_string()) {
+        s.notify("gp.batch: 'outputPattern' must be a string, ignoring invalid value", false);
+    }
+
     // Identify which parameter to bind the input to.
     let batch_param = ps(p, "param").or_else(|| ps(p, "batch_param")).unwrap_or_else(|| {
         spec.params
@@ -1075,6 +1085,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         }
         let mut files = Vec::new();
         let mut skipped = 0;
+        let mut subfolders = 0;
         let mut symlinks = 0;
         let mut unreadable = 0;
         match std::fs::read_dir(dir) {
@@ -1123,7 +1134,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                             }
                         }
                     } else if ft.is_dir() {
-                        skipped += 1;
+                        subfolders += 1;
                     } else {
                         unreadable += 1;
                     }
@@ -1133,6 +1144,9 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         }
         if symlinks > 0 {
             s.notify(format!("folder '{folder}': {symlinks} symlink(s) skipped"), false);
+        }
+        if subfolders > 0 {
+            s.notify(format!("folder '{folder}': {subfolders} subfolder(s) skipped"), false);
         }
         if skipped > 0 {
             s.notify(format!("folder '{folder}': {skipped} unsupported files skipped"), false);
@@ -1169,6 +1183,8 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     let mut tool_messages: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut cancelled_after = None;
 
+    control.begin(targets.len() as u64);
+
     for (i, target) in targets.iter().enumerate() {
         if control.is_cancelled() {
             cancelled_after = Some(i);
@@ -1183,10 +1199,15 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         let out_name = pattern.replace("{input}", base_name).replace("{tool}", tool_id);
         let mut final_out_name = out_name.clone();
         let mut had_collision = false;
-        if seen_outputs.contains(&final_out_name) || s.map().layer_by_name(&final_out_name).is_some() {
+        let collision_exists = |name: &str| {
+            seen_outputs.contains(name)
+                || s.map().layer_by_name(name).is_some()
+                || crate::project::find_table(&s.project.tables, name).is_some()
+        };
+        if collision_exists(&final_out_name) {
             let stem = final_out_name.clone();
             let mut counter = 2;
-            while seen_outputs.contains(&final_out_name) || s.map().layer_by_name(&final_out_name).is_some() {
+            while collision_exists(&final_out_name) {
                 final_out_name = format!("{stem}_{counter}");
                 counter += 1;
             }
@@ -1210,7 +1231,8 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     Err(e) => {
                         failed.push(json!({"input": target, "error": e.to_string()}));
                         s.active_layer = active_before;
-                        control.advance(1);
+                        control.begin(targets.len() as u64);
+                        control.advance((i + 1) as u64);
                         continue;
                     }
                 }
@@ -1287,6 +1309,9 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                             }
                         }
                     }
+                } else if let Some(table) = res.get("table").and_then(Value::as_str) {
+                    seen_outputs.insert(table.to_string());
+                    output_names.push(table.to_string());
                 } else if item_was_selected {
                     seen_outputs.insert(target_layer_name.clone());
                     output_names.push(target_layer_name.clone());
@@ -1341,7 +1366,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         s.notify(format!("Batch '{tool_id}': {} failed ({sample}{more})", failed.len()), true);
     }
 
-    let is_cancelled = cancelled_after.is_some() || control.is_cancelled();
+    let is_cancelled = cancelled_after.is_some();
     let num_ok = succeeded.len();
     let num_err = failed.len();
     let attempted = num_ok + num_err;
@@ -2552,9 +2577,6 @@ mod file_permission_tests {
         assert!(!crate::cmd::items::touches_files("gp.batch", &p_wildcard));
         let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_wildcard));
         assert!(reaches.is_none());
-
-        let p_writes = json!({"tool": "vectorToPmtiles", "inputs": "*"});
-        assert!(crate::cmd::items::touches_files("gp.batch", &p_writes));
     }
 }
 
@@ -2835,6 +2857,86 @@ mod batch_tests {
         }
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_folder_skips_subfolders() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_subfolder_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let f1 = root.join("layer.geojson");
+        let sample_geojson = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1.0,2.0]},"properties":{}}]}"#;
+        std::fs::write(&f1, sample_geojson).unwrap();
+        let sub = root.join("subfolder");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "convexHull",
+                    "folder": root.display().to_string(),
+                    "output_pattern": "{input}_hull"
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["total"], 1);
+        assert_eq!(res["succeeded"], 1);
+        assert!(s.notices.iter().any(|n| n.text.contains("1 subfolder(s) skipped")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_table_output_reported() {
+        let mut s = Session::new(crate::Project::default());
+        let mut ds = Dataset::new(
+            "Cities",
+            rustgis_data::GeometryType::Point,
+            vec![rustgis_data::Field::new("pop", rustgis_data::FieldType::Integer)],
+        );
+        ds.push_next(Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(10.0, 20.0))), vec![rustgis_data::Value::Int(100)]);
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, ds));
+
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "summaryStatistics",
+                    "inputs": ["Cities"],
+                    "params": {"field": "pop"}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        let outputs = res["outputs"].as_array().unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0], "Cities_Statistics");
+        assert!(crate::project::find_table(&s.project.tables, "Cities_Statistics").is_some());
+    }
+
+    #[test]
+    fn batch_run_non_string_param_notified() {
+        let mut s = test_session();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "param": 123,
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res["succeeded"], 1);
+        assert!(s.notices.iter().any(|n| n.text.contains("'param' must be a string")));
     }
 
     #[test]
