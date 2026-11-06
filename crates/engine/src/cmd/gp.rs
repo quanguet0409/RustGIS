@@ -1417,8 +1417,8 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                 match rustgis_data::io::read_path(path) {
                     Ok((dataset, report)) => {
                         for msg in report.messages {
-                            reader_warnings.push((target.clone(), msg.clone()));
                             item_reader_warnings.push(format!("{target}: {msg}"));
+                            reader_warnings.push((target.clone(), msg));
                         }
                         Some(super::layer::add_dataset(s, dataset))
                     }
@@ -3524,10 +3524,11 @@ mod batch_tests {
         let symlink_file = root.join("link.geojson");
 
         #[cfg(unix)]
-        let linked = std::os::unix::fs::symlink(&target_file, &symlink_file).is_ok();
+        std::os::unix::fs::symlink(&target_file, &symlink_file).unwrap();
         #[cfg(windows)]
-        let linked = std::os::windows::fs::symlink_file(&target_file, &symlink_file).is_ok();
+        let _ = std::os::windows::fs::symlink_file(&target_file, &symlink_file);
 
+        let linked = symlink_file.exists();
         if linked {
             let mut s = Session::new(crate::Project::default());
             let res = s

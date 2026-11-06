@@ -875,8 +875,6 @@ pub(crate) fn layer_name_left_out<'a>(command: &str, params: &'a Value) -> std::
     };
     let plain = |t: &str| !t.trim().is_empty() && !t.contains(['/', '\\', '.', ':']) && !looks_like_path(t);
     let named = || params.pointer("/params/output").and_then(Value::as_str).is_some_and(plain);
-    // Copied only when there is a name to leave out: other commands' parameters (a file's
-    // contents, say) are read as they are.
     if command == "gp.batch" {
         let has_builtin_plain_output = built_in()
             && params.get("params").and_then(Value::as_object).and_then(|p| p.get("output")).and_then(Value::as_str).is_some_and(plain);
@@ -899,6 +897,8 @@ pub(crate) fn layer_name_left_out<'a>(command: &str, params: &'a Value) -> std::
         }
         return Cow::Owned(out);
     }
+    // Copied only when there is a name to leave out: other commands' parameters (a file's
+    // contents, say) are read as they are.
     if command != "gp.run" || !built_in() || !named() {
         return Cow::Borrowed(params);
     }
