@@ -879,6 +879,7 @@ pub(crate) fn layer_name_left_out<'a>(command: &str, params: &'a Value) -> std::
         let mut modified = false;
         if built_in()
             && let Some(p) = out.get_mut("params").and_then(Value::as_object_mut)
+            && p.get("output").and_then(Value::as_str).is_some_and(plain)
             && p.remove("output").is_some()
         {
             modified = true;

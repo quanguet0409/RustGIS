@@ -3043,6 +3043,12 @@ mod file_permission_tests {
         let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_wildcard_output));
         assert!(reaches.is_none());
 
+        // Wildcard batch with non-plain params.output (looks like path / has slashes) touches files.
+        let p_wildcard_path_output = json!({"tool": "convexHull", "inputs": "*", "params": {"output": "/home/u/.bashrc"}});
+        assert!(crate::cmd::items::touches_files("gp.batch", &p_wildcard_path_output));
+        let reaches = s.registry.get("gp.batch").and_then(|spec| crate::cmd::plugins::reaches(spec, &p_wildcard_path_output));
+        assert!(matches!(reaches, Some(crate::cmd::plugins::Reach::Files)));
+
         // For a tool that is not built-in, or if params.output points to a file, wildcard batch touches files.
         let p_wildcard_non_builtin = json!({"tool": "nonExistentExternalTool", "inputs": "*", "params": {"output": "some_file.shp"}});
         assert!(crate::cmd::items::touches_files("gp.batch", &p_wildcard_non_builtin));
