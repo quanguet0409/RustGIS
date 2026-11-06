@@ -493,12 +493,105 @@ fn model_graph(s: &Session, p: &Value) -> Result<(String, crate::project::ModelG
         Some(n) => s.project.models.iter().find(|m| m.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no model '{n}'"))?,
         None => s.project.models.last().ok_or("the project has no models")?,
     };
-    let g = model.graph.clone().unwrap_or_else(|| crate::model::steps_to_graph(&model.steps));
+    let g = match &model.graph {
+        Some(graph) => graph.clone(),
+        None => crate::model::checked_steps_to_graph(&model.steps)?,
+    };
     Ok((model.name.clone(), g, s.trusted_models.contains(&model.name.to_ascii_lowercase())))
 }
 
-/// Runs a model's graph, or the graph passed.
+/// Runs a model's graph, or the graph passed: taking the tools the app ran ahead
+/// ([`ahead_on_copy`]) whose inputs are still the same.
 fn run_model(s: &mut Session, p: &Value) -> CmdResult {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(ran) = super::reads::take::<Vec<super::gp::RanAhead>>(s, MODEL_AHEAD) {
+        return super::gp::taking(s, ran, |s| run_model_here(s, p));
+    }
+    run_model_here(s, p)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// The key of a model's tools run ahead ([`ahead_on_copy`]).
+const MODEL_AHEAD: &str = "model.run";
+
+#[cfg(not(target_arch = "wasm32"))]
+/// The key of a script's tools run ahead ([`ahead_on_copy`]).
+const SCRIPT_AHEAD: &str = "script.run";
+
+#[cfg(not(target_arch = "wasm32"))]
+/// `command` (`model.run` or `script.run`) run on a copy of the session, made on a thread of its
+/// own: it records what each tool it runs read and made, for the command to take instead of
+/// running them again, so what the run adds, says, logs and puts in Undo is the same as when it
+/// runs here. It stops at a tool that writes files, a plugin's or GeoLibre's, and at a script's
+/// line that may reach outside the session ([`runs_on_a_copy`]): from there the run here runs
+/// them as it always has. What it says and how it ends are the run here's to say.
+pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> super::reads::ReadAhead {
+    let name = if command == SCRIPT_AHEAD { "Run Script" } else { "Run Model" };
+    let (project, trusted) = (s.project.clone(), s.trusted_models.clone());
+    let (view_size, active_layer, p) = (s.view_size, s.active_layer, p.clone());
+    // What its tools ask of servers and files goes in this session's Diagnostics, as when they
+    // run here: the run here takes their results and asks nothing.
+    let requests = s.diagnostics.capture();
+    super::reads::ahead(name, command.into(), move || {
+        let mut copy = Session::new(project);
+        copy.requests_into = Some(requests);
+        copy.trusted_models = trusted;
+        copy.view_size = view_size;
+        copy.active_layer = active_layer;
+        copy.tools_ahead = Some(super::gp::Ahead::Recording(Vec::new()));
+        let _ = copy.run(command, &p);
+        super::gp::ran_ahead(&mut copy)
+    })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// A script's run on a copy of the session ([`ahead_on_copy`]), unless its first line would stop
+/// the copy at once (or the script doesn't read): then it runs here, with no copy made.
+pub(crate) fn script_ahead(s: &Session, p: &Value) -> Option<super::reads::ReadAhead> {
+    let lines = script_commands(ps(p, "script")?).ok()?;
+    let (_, id, params) = lines.first()?;
+    runs_on_a_copy(id, params).then(|| ahead_on_copy(s, SCRIPT_AHEAD, p))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// The commands a script's line may run on a copy of the session ([`runs_on_a_copy`]): those
+/// whose results are taken (a tool, a model) and those that change only what the taking compares
+/// by value (a selection, a layer's name or query, the environment, the projection). A line that
+/// makes rows of its own (an edit, a layer from a selection) isn't one: the rows it made on the
+/// copy are never the run here's, so every tool after it would run again.
+pub(crate) const ON_A_COPY: &[&str] = &[
+    "model.run",
+    "gp.run",
+    "gp.spatialJoin",
+    "gp.zonalStats",
+    "gp.env",
+    "select.all",
+    "select.atPoint",
+    "select.byAttributes",
+    "select.byPolygon",
+    "select.byRadius",
+    "select.byRect",
+    "select.clear",
+    "select.rows",
+    "select.switch",
+    "layer.remove",
+    "layer.rename",
+    "layer.definitionQuery",
+    "layer.select",
+    "map.projection",
+];
+
+#[cfg(not(target_arch = "wasm32"))]
+/// Whether a script's line runs on a copy of the session ([`ahead_on_copy`]): one of
+/// [`ON_A_COPY`], naming no file: run twice, none changes anything outside the session. Any
+/// other line stops the copy there, Add Data and Load All among them (they would read their
+/// files and servers twice).
+fn runs_on_a_copy(id: &str, params: &Value) -> bool {
+    // A model's own tools are checked as they run; any other line by what its parameters name.
+    ON_A_COPY.contains(&id) && (id == "model.run" || !super::items::touches_files(id, params))
+}
+
+fn run_model_here(s: &mut Session, p: &Value) -> CmdResult {
     // A model saved as steps runs as steps: `%n` may stand anywhere in them, and inputs may be files.
     if p.get("graph").is_none_or(Value::is_null) {
         let model = match ps(p, "name") {
@@ -618,11 +711,26 @@ fn wire(v: &mut Value, outputs: &[String], step: usize, depth: usize) -> Result<
 /// any command, files included; notebooks vet cells that came from files before running them.
 /// The whole script is one undo step.
 pub(crate) fn run_script(s: &mut Session, p: &Value) -> CmdResult {
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(ran) = super::reads::take::<Vec<super::gp::RanAhead>>(s, SCRIPT_AHEAD) {
+        return super::gp::taking(s, ran, |s| run_script_here(s, p));
+    }
+    run_script_here(s, p)
+}
+
+/// Runs a script's lines in order ([`run_script`]).
+fn run_script_here(s: &mut Session, p: &Value) -> CmdResult {
     let script = ps(p, "script").ok_or("script is required")?;
     let mut out = Vec::new();
     for (n, id, params) in script_commands(script)? {
         let spec = s.registry.get(&id).ok_or_else(|| format!("line {n}: unknown command '{id}'"))?;
         let (run, enabled, mutates, label) = (spec.run, spec.enabled, spec.mutates, spec.label);
+        // On a copy of the session ([`ahead_on_copy`]): from a line that may reach outside it,
+        // the run here runs the rest.
+        #[cfg(not(target_arch = "wasm32"))]
+        if matches!(s.tools_ahead, Some(super::gp::Ahead::Recording(_))) && !runs_on_a_copy(&id, &params) {
+            return Err(super::gp::NOT_AHEAD.into());
+        }
         // As when typed directly, a line naming a layer is checked against that layer.
         if params.get("layer").is_some()
             && let Ok(lid) = s.layer_id(&params)
@@ -636,10 +744,19 @@ pub(crate) fn run_script(s: &mut Session, p: &Value) -> CmdResult {
         if let Some(e) = s.streamed_edit(&id, mutates, label, s.active_layer) {
             return Err(format!("line {n}: {e}"));
         }
-        let r = run(s, &params).map_err(|e| format!("line {n}: {id}: {e}"))?;
+        let r = steps_of(s, |s| run(s, &params)).map_err(|e| format!("line {n}: {id}: {e}"))?;
         out.push(json!({"line": n, "command": id, "result": r}));
     }
     Ok(json!({"ran": out}))
+}
+
+/// `run` as a step of the command running now ([`Session::steps_running`] counts it, on every
+/// path, a panic included, which is raised again).
+pub(crate) fn steps_of<T>(s: &mut Session, run: impl FnOnce(&mut Session) -> T) -> T {
+    s.steps_running += 1;
+    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(s)));
+    s.steps_running = s.steps_running.saturating_sub(1);
+    r.unwrap_or_else(|p| std::panic::resume_unwind(p))
 }
 
 /// The most lines a script is read to: Run reads no further, and the Script pane colours no further.

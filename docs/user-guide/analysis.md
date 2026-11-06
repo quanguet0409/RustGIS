@@ -173,6 +173,7 @@ Use these ids in `gp.run`'s `tool` parameter (`gp.tools` lists the available too
 | Feature Envelope To Polygon | `featureEnvelopeToPolygon` | Data Management › Features |
 | Unsplit Line | `unsplitLine` | Data Management › Features |
 | Check Geometry | `checkGeometry` | Data Management › Features |
+| Repair Geometry | `repairGeometry` | Data Management › Features |
 | XY Table To Point | `xyTableToPoint` | Data Management › Features |
 | Calculate Geometry Attributes | `calculateGeometry` | Data Management › Features |
 | Simplify | `simplify` | Cartography › Generalization |
@@ -909,6 +910,83 @@ of their rings or parts already have problems of their own. Rings and parts that
 gp.run={"tool":"checkGeometry","params":{"input":"Parcels"}}
 ```
 
+### Repairing geometry
+
+**Repair Geometry** (`repairGeometry`) writes every feature to a new layer, `<input>_repaired`
+unless you name it, with its geometry made valid by the rules Check Geometry checks. Only the
+selected features are processed when some are selected. Each output row keeps its feature id,
+fields, attributes and CRS, and adds a text field `repairs`: the codes of what was repaired,
+separated by `, ` and in the order of the table above, or empty for a feature that needed
+nothing. Features with nothing wrong are copied exactly as stored. If the input already has a
+`repairs` field, the new one gets the next free name (`repairs_2`) and the tool says so.
+
+How each problem is repaired:
+
+- `ring_not_closed`: the ring is closed with its first point. `repeated_vertex`: the repeats are
+  dropped. `too_few_points`: the ring or line part is dropped; an exterior ring takes its part's
+  holes with it, and a polygon part without rings is dropped too. These fixes move no coordinate:
+  a feature with only these problems keeps every other vertex exactly.
+- `self_intersection`, `hole_outside_shell`, `rings_intersect`, `disconnected_interior` and
+  `parts_overlap`: the polygon is rebuilt from its area, as the "structure" method of make-valid
+  tools does. Each ring stands for the area it winds around, so a bowtie keeps both of its
+  triangles and the direction rings are wound in doesn't matter: GeoJSON and Shapefiles, which
+  wind them in opposite directions, give the same result. Each part is its exterior ring's area
+  less the union of its holes' areas, and the feature is the union of its parts. So overlapping
+  parts merge into one, overlapping holes merge, a hole outside its exterior ring disappears (what
+  of a hole lies inside it stays a hole), and an interior cut into pieces by rings touching at
+  points becomes one part per piece. A stretch of ring that runs back over itself, with no area,
+  is left out. Rebuilt exterior rings wind counter-clockwise, holes clockwise.
+- Lines may cross themselves, so only their repeated vertices and their parts with fewer than 2
+  distinct points are repaired. Points have nothing to repair but non-finite coordinates.
+
+When a ring of a part crosses itself, Check Geometry doesn't check that part against its other
+rings or the other parts; Repair Geometry checks the feature again after the fixes that move no
+coordinate, and adds `hole_outside_shell`, `rings_intersect` and `parts_overlap` when the rebuild
+finds a hole outside, merges holes or merges parts.
+
+The rebuild uses the [geo](https://github.com/georust/geo) library's boolean overlay, which works on
+an integer grid: half the larger side of the feature's extent spans about 2<sup>29</sup> steps.
+Coordinates are stored in degrees of longitude and latitude, so a step is about
+0.000 000 000 12° (0.013 mm) for a feature 10 km across, and about 0.000 000 24° (2.6 cm at the
+equator) for one spanning the world. Rebuilt coordinates may move by up to five steps from the
+input's rings; in the tests they moved at most two thirds of a step. The overlay also leaves out
+vertices in the middle of straight edges. The tool says how many features were rebuilt and the
+farthest, in degrees, their coordinates may have moved. Every rebuilt geometry is checked again and
+written only when it is valid.
+
+A hole or part narrower than one step of that grid in any direction can be rounded onto a single
+line of it and lose its area, depending on where it lies between the grid's lines. Rounding moves a
+point by up to half a step on each axis, so across a diagonal a piece needs to be wider, up to √2
+steps at 45°. The grid follows the extent of all the rings of a part, or of all the parts of a
+feature, so this happens to a tiny or thin hole or part far from the others, such as a long sliver
+at an angle. So before the overlay takes out a part's holes or merges the parts, a hole or part
+that narrow in any direction is dropped: `no_area` is added after the other codes in `repairs`, and
+the tool says how many holes and parts were dropped this way, from how many features.
+
+A feature that can't be repaired stays in the output without geometry, with its attributes, and
+`repairs` says why. One the tool couldn't repair is written unchanged, never dropped:
+
+| Code | Written | Why |
+| --- | --- | --- |
+| `null_geometry` | without geometry | No geometry, or one without coordinates |
+| `non_finite_coordinate` | without geometry | A coordinate is not a number or infinite |
+| `too_few_points` | without geometry | Every part has too few distinct points |
+| `no_area` | without geometry | Nothing with an area is left once repaired: a ring whose points all lie on one line, or holes covering their whole part |
+| `too_complex` | unchanged | Checking or rebuilding it needs more work than the tool spends on one feature (for the rebuild, about 2 million vertices, counting those it adds where rings cross), or there wasn't enough memory for it |
+| `repair_failed` | unchanged | The geo library failed on it: its relate operation while checking, the overlay, coordinates too large or too small for the overlay's grid, or a rebuilt geometry that isn't valid |
+
+The messages say how many features were repaired, with each code; how many were written without
+geometry and why; how many were left unchanged for each reason; how many rings or parts were
+dropped, and how many holes or parts narrower than the overlay's grid; from how many features holes
+were taken out; in how many parts were merged or pieces written as parts of their own; and how far
+rebuilt coordinates may have moved. On the desktop and the command line a failure of the overlay is
+caught and the feature written unchanged; in the browser it can't be caught, so the rebuild runs only on finite coordinates the grid can hold, with
+its work bounded and its memory asked of the browser first, as in Clip and Dissolve.
+
+```text
+gp.run={"tool":"repairGeometry","params":{"input":"Parcels"}}
+```
+
 ## GeoLibre tools
 
 The desktop app and the command line can also run the
@@ -1046,7 +1124,14 @@ The **Script** pane runs commands from text, one per line (`id {json}`); its box
 short of the buttons, and then scrolls, so **Run** stays in view; Ctrl+Enter (⌘+Enter on macOS)
 in the box runs the script too. Above a run's results, a line tells its number, how long it took
 and when it started (`Run #2 (0.84 s)`, and `14:04 UTC` on the right), so a run made again by
-mistake shows (Undo takes a whole run back). It colours the commands as you type, in both
+mistake shows (Undo takes a whole run back). On the desktop, a script's tools and models, with
+selections, layer renames and definition queries, the environment and the projection between
+them, are worked out in the background first, so the map and the rest of the window stay in
+use: the status bar shows **Run Script** and **Cancel**, and the results say **Running…** until
+the run is added. From the first line of any other kind (an edit, Add Data, a save, an export,
+a style or a zoom, a plugin or GeoLibre tool, a tool that writes a file) the rest runs as a
+script always has, holding the window until it finishes. A tool whose inputs change meanwhile runs again as the
+results are added, as in a model's run. It colours the commands as you type, in both
 themes: `#` comments in green italics, the command id, and the JSON's strings, numbers and
 `true`/`false`/`null`; an id no command has, or one that can't run in a script (`ui.*`, `script.*`,
 `notebook.run`), and parameters that aren't valid JSON are red and underlined. A script is read to
@@ -1115,10 +1200,45 @@ their name.
   are none. The tools then run in flow order, and each node shows how it fared. A result that
   only feeds other tools is removed once the model has run; the outputs, and tools at the end
   of the flow, stay on the map. A run that fails is undone as a whole.
+- On the desktop, **Run** (here or in the Workflows pane's Models section) works out the tools
+  in the background, so the map and the rest of the window stay in use: the status bar shows
+  **Run Model**, how far its current tool has come, and **Cancel**, and the canvas says
+  **Running…** until the results are added, as one step to undo. What a tool reads that changes
+  meanwhile (an edit, a selection, a layer added or reordered, the environment, the projection)
+  has that tool and those after it run again as the results are added, and so does a tool that
+  writes a file, a plugin tool or a GeoLibre tool, with those after it. Those run as a model
+  always has, holding the window until they finish, with the work limits of a run that can't
+  be cancelled. A file a tool reads by its path isn't compared: one changed during the run
+  gives the result from what was read. A model run from a script in the Script pane is worked
+  out in the background with the script; one run from the command line or the assistant runs
+  where the command runs.
 - **Save** keeps the model in the project; **Export** writes it as a `*.model.json` file, which
   **Import** (or dropping the file on the window) opens again. A model from a file may not read
   or write files. **Copy Command** copies a `model.run` command that runs the model from the
   Script pane, the command line or Python.
+
+Import checks declared model and web-tool versions before interpreting their contents. Unsupported
+versions, unreadable nodes, connections or steps, and unknown file, graph, node, connection or step
+fields are refused. A file containing both a graph and steps is refused rather than choosing one.
+Connections using unknown ports or feeding multiple sources into a single-valued port are refused.
+Connections from inputs with missing or blank layer names are also refused. For connections to tools,
+layer names must have no surrounding whitespace, must not look like numeric step references (`%1`),
+and must not contain semicolons on multi-input ports; these names cannot be preserved in steps.
+Graphs that would lose nodes or connections during import are refused with a count and
+advice to fix the file, leaving the current project unchanged. Supported files and legacy files
+without a version marker continue to import, including repeated sources in multi-input tools such
+as Merge. Graphs containing a loop are refused rather than becoming empty steps. IDs that need
+trimming or exceed 100 characters, and positions outside the supported
+canvas bounds, are refused before they can be changed. Repeated inputs stay intact when an imported
+model is saved or renamed. If import must trim, shorten or replace a model name, or make it unique,
+it reports the change with a notice.
+
+Step files keep the existing 2,000-step limit. Converting steps to a ModelBuilder graph has a
+1,000-step limit: opening, exporting or checking (`model.validate`) a larger model as a graph
+gives an error and leaves the
+original steps intact. References to a step that is not earlier in the model, or has no layer
+output, also stop graph conversion before data can be dropped. Larger models can still run as
+steps or be shared as a web tool.
 
 The Workflows pane's Models section lists the project's models, and New Model From History turns
 the geoprocessing you've run into one. Models made as steps (`model.new` with `steps`, where `%1`
