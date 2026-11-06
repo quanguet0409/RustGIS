@@ -1415,7 +1415,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         #[cfg(not(target_arch = "wasm32"))]
         let mut res_was_selected = false;
 
-        match run_tool_quiet(s, tool_id, &item_params, Some(&record_params), cmd_record, control) {
+        match run_tool_quiet(s, tool_id, &item_params, Some(&record_params), cmd_record.clone(), control) {
             Ok((res, messages)) => {
                 succeeded.push(target.clone());
                 if !messages.is_empty() {
@@ -1532,9 +1532,20 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                     succeeded.pop();
                     let err = messages.last().cloned().unwrap_or_else(|| "tool produced no output".into());
                     if let Some(last) = s.project.gp_history.last_mut() {
-                        last.ok = false;
-                        if !last.messages.contains(&err) {
-                            last.messages.push(err.clone());
+                        let matches_item = last.id == tool_id
+                            && (last.params.get(batch_param).and_then(Value::as_str) == Some(target)
+                                || last
+                                    .command
+                                    .as_ref()
+                                    .and_then(|(_, c)| c.get("inputs").and_then(Value::as_array))
+                                    .and_then(|a| a.first())
+                                    .and_then(Value::as_str)
+                                    == Some(target));
+                        if matches_item {
+                            last.ok = false;
+                            if !last.messages.contains(&err) {
+                                last.messages.push(err.clone());
+                            }
                         }
                     }
                     failed.push(json!({"input": target, "error": err.clone()}));
@@ -1567,12 +1578,55 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         }
 
         #[cfg(not(target_arch = "wasm32"))]
-        if !item_reader_warnings.is_empty()
-            && let Some(last) = s.project.gp_history.last_mut()
-        {
-            for msg in &item_reader_warnings {
-                if !last.messages.contains(msg) {
-                    last.messages.push(msg.clone());
+        if !item_reader_warnings.is_empty() {
+            let matched = if let Some(record) = s.project.gp_history.last_mut() {
+                let matches_item = record.id == tool_id
+                    && (record.params.get(batch_param).and_then(Value::as_str) == Some(target)
+                        || record
+                            .command
+                            .as_ref()
+                            .and_then(|(_, c)| c.get("inputs").and_then(Value::as_array))
+                            .and_then(|a| a.first())
+                            .and_then(Value::as_str)
+                            == Some(target));
+                if matches_item {
+                    for msg in &item_reader_warnings {
+                        if !record.messages.contains(msg) {
+                            record.messages.push(msg.clone());
+                        }
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if !matched {
+                let spec = rustgis_analysis::tool(tool_id);
+                let name = spec.map(|t| t.name).unwrap_or("Tool").to_string();
+                let mut msgs = item_reader_warnings.clone();
+                if let Some(last_err) = errors.last().and_then(|e| e.get("error")).and_then(Value::as_str)
+                    && !msgs.iter().any(|m| m == last_err)
+                {
+                    msgs.insert(0, last_err.to_string());
+                }
+                s.project.gp_history.push(
+                    GpRecord {
+                        tool: name,
+                        id: tool_id.to_string(),
+                        params: record_params.clone(),
+                        command: cmd_record.clone(),
+                        at: now_ms() / 1000,
+                        ok: false,
+                        messages: msgs,
+                        millis: 0,
+                        outputs: Vec::new(),
+                    }
+                    .scrubbed(),
+                );
+                if s.project.gp_history.len() > 500 {
+                    s.project.gp_history.remove(0);
                 }
             }
         }
@@ -1819,7 +1873,23 @@ fn run_tool_internal(
             replace_tables,
         );
     }
-    let inputs = map_inputs(s, rustgis_analysis::tool(&tool), &params)?;
+    let inputs = match map_inputs(s, rustgis_analysis::tool(&tool), &params) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            let spec = rustgis_analysis::tool(&tool);
+            let name = spec.map(|t| t.name).unwrap_or("Tool").to_string();
+            let millis = now_ms().saturating_sub(t0);
+            return apply_inner(
+                s,
+                Ran { name, id: tool, command, started: t0 },
+                recorded(spec, rec_val.clone()),
+                Err(e),
+                millis,
+                notify_messages,
+                replace_tables,
+            );
+        }
+    };
     let mut res = rustgis_analysis::run_with(&tool, &inputs, &params, control);
     if let Ok(result) = &mut res {
         result.messages.extend(inputs.messages.iter().cloned());
@@ -2006,6 +2076,9 @@ fn apply_inner(
                 GpRecord { tool: name, id, params, command, at, ok: false, messages: vec![e.clone()], millis, outputs: Vec::new() }
                     .scrubbed(),
             );
+            if s.project.gp_history.len() > 500 {
+                s.project.gp_history.remove(0);
+            }
             return Err(e);
         }
         Ok(r) => r,
@@ -5117,6 +5190,97 @@ mod batch_tests {
             assert!(record.ok);
             assert!(record.messages.iter().any(|m| m.contains("Z or M")));
         }
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_setup_failure_records_failed_history_and_attaches_reader_warnings() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_setup_fail_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // f1 is inside extent [0, 0, 50, 50]
+        let f1 = root.join("f1.geojson");
+        let content_inside = json!({
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [10.0, 20.0, 30.0]
+                },
+                "properties": {"name": "Inside"}
+            }]
+        })
+        .to_string();
+        std::fs::write(&f1, content_inside).unwrap();
+
+        // f2 is outside extent [0, 0, 50, 50]
+        let f2 = root.join("f2.geojson");
+        let content_outside = json!({
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "geometry": {
+                    "type": "Point",
+                    "coordinates": [100.0, 100.0, 30.0]
+                },
+                "properties": {"name": "Outside"}
+            }]
+        })
+        .to_string();
+        std::fs::write(&f2, content_outside).unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        s.project.gp_env.extent = Some(rustgis_geom::Extent::new(0.0, 0.0, 50.0, 50.0));
+
+        let f1_str = f1.display().to_string();
+        let f2_str = f2.display().to_string();
+
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": [f1_str.clone(), f2_str.clone()],
+                    "params": {"distance": 5}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        assert_eq!(res["failed"], 1);
+
+        // Result retained diagnostics for both
+        let warnings = res["warnings"].as_array().unwrap();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings[0]["input"].as_str().unwrap().contains("f1.geojson"));
+        assert!(warnings[1]["input"].as_str().unwrap().contains("f2.geojson"));
+
+        let errors = res["errors"].as_array().unwrap();
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0]["input"], f2_str);
+        assert!(errors[0]["error"].as_str().unwrap().contains("environment's extent"));
+
+        // History: each run has its own GpRecord
+        assert_eq!(s.project.gp_history.len(), 2);
+
+        // f1 record
+        let rec1 = &s.project.gp_history[0];
+        assert!(rec1.ok);
+        assert_eq!(rec1.params["input"], f1_str);
+        assert!(rec1.messages.iter().any(|m| m.contains("Z or M")));
+        assert!(!rec1.messages.iter().any(|m| m.contains("environment's extent")));
+
+        // f2 record: created for setup failure, contains its own error and reader warning
+        let rec2 = &s.project.gp_history[1];
+        assert!(!rec2.ok);
+        assert_eq!(rec2.params["input"], f2_str);
+        assert!(rec2.messages.iter().any(|m| m.contains("environment's extent")));
+        assert!(rec2.messages.iter().any(|m| m.contains("Z or M")));
 
         let _ = std::fs::remove_dir_all(root);
     }
