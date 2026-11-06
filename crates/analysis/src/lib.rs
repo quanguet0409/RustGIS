@@ -380,6 +380,16 @@ pub fn resolve_params(spec: &ToolSpec, params: &Value) -> Result<Value, String> 
     Ok(Value::Object(p))
 }
 
+pub use tools::JOIN_FIELD_ALIASES;
+
+/// Whether a parameter key is declared by `spec` or accepted as a valid parameter alias.
+pub fn is_accepted_param(spec: &ToolSpec, key: &str) -> bool {
+    if spec.params.iter().any(|p| p.name == key) {
+        return true;
+    }
+    if spec.id == "joinField" { JOIN_FIELD_ALIASES.contains(&key) } else { false }
+}
+
 /// A built-in tool's on-off parameter as `true` or `false` (text saying so counts). Anything else is
 /// an error, never a guess at what `"yes"` or `1` meant (#406). A blank value, or null, is the
 /// default.

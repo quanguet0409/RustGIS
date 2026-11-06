@@ -1015,7 +1015,12 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     }
 
     // Identify which parameter to bind the input to.
-    let batch_param = ps(p, "param").or_else(|| ps(p, "batch_param")).unwrap_or_else(|| {
+    let param_opt = ps(p, "param");
+    let batch_param_opt = ps(p, "batch_param");
+    if param_opt.is_some() && batch_param_opt.is_some() {
+        s.notify("gp.batch: 'batch_param' ignored because 'param' is set", false);
+    }
+    let batch_param = param_opt.or(batch_param_opt).unwrap_or_else(|| {
         spec.params
             .iter()
             .find(|param| {
@@ -1040,7 +1045,12 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         return Err(format!("tool '{tool_id}' writes a file, not a layer; gp.batch runs tools that add layers"));
     }
 
-    let explicit_pattern = ps(p, "outputPattern").or_else(|| ps(p, "output_pattern"));
+    let pattern_camel = ps(p, "outputPattern");
+    let pattern_snake = ps(p, "output_pattern");
+    if pattern_camel.is_some() && pattern_snake.is_some() {
+        s.notify("gp.batch: 'output_pattern' ignored because 'outputPattern' is set", false);
+    }
+    let explicit_pattern = pattern_camel.or(pattern_snake);
     let pattern = explicit_pattern.unwrap_or("{input}_{tool}");
     if !pattern.contains("{input}") {
         return Err("outputPattern must include '{input}' to avoid output name collisions".into());
@@ -1062,21 +1072,11 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         s.notify(format!("gp.batch: 'params.{batch_param}' is replaced by the batch inputs"), false);
     }
 
-    let declared: Vec<&str> = spec.params.iter().map(|param| param.name).collect();
     let mut unknown: Vec<&str> = base_params
         .as_object()
         .into_iter()
         .flat_map(|map| map.keys().map(String::as_str))
-        .filter(|key| {
-            if declared.contains(key) || *key == batch_param {
-                return false;
-            }
-            if spec.id == "joinField" {
-                !matches!(*key, "input" | "target_layer" | "join" | "source" | "join_table" | "join_field" | "join_key")
-            } else {
-                true
-            }
-        })
+        .filter(|key| !rustgis_analysis::is_accepted_param(spec, key) && *key != batch_param)
         .collect();
     if !unknown.is_empty() {
         unknown.sort();
@@ -4753,6 +4753,139 @@ mod batch_tests {
         assert!(
             !recent_clean.iter().any(|n| n.text.contains("is replaced by the batch inputs")),
             "clean call must not emit replacement notice: {recent_clean:?}"
+        );
+    }
+
+    #[test]
+    fn batch_run_alias_precedence_emits_notice() {
+        let mut s = test_session();
+
+        // Both param and batch_param
+        let mark1 = s.notices.len() as u64;
+        let res1 = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "param": "input",
+                    "batch_param": "input",
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res1["succeeded"], 1);
+        let recent1 = s.notices_since(mark1);
+        assert!(
+            recent1.iter().any(|n| n.text.contains("gp.batch: 'batch_param' ignored because 'param' is set")),
+            "expected notice for dropped batch_param: {recent1:?}"
+        );
+
+        // Clean call with only param
+        let mut s_clean1 = test_session();
+        let mark_clean1 = s_clean1.notices.len() as u64;
+        let res_clean1 = s_clean1
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "param": "input",
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res_clean1["succeeded"], 1);
+        let recent_clean1 = s_clean1.notices_since(mark_clean1);
+        assert!(
+            !recent_clean1.iter().any(|n| n.text.contains("ignored because")),
+            "clean call must not emit dropped alias notice: {recent_clean1:?}"
+        );
+
+        // Both outputPattern and output_pattern
+        let mut s2 = test_session();
+        let mark2 = s2.notices.len() as u64;
+        let res2 = s2
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "outputPattern": "{input}_pat1",
+                    "output_pattern": "{input}_pat2",
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res2["succeeded"], 1);
+        let recent2 = s2.notices_since(mark2);
+        assert!(
+            recent2.iter().any(|n| n.text.contains("gp.batch: 'output_pattern' ignored because 'outputPattern' is set")),
+            "expected notice for dropped output_pattern: {recent2:?}"
+        );
+
+        // Clean call with only outputPattern
+        let mut s_clean2 = test_session();
+        let mark_clean2 = s_clean2.notices.len() as u64;
+        let res_clean2 = s_clean2
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "outputPattern": "{input}_pat1",
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res_clean2["succeeded"], 1);
+        let recent_clean2 = s_clean2.notices_since(mark_clean2);
+        assert!(
+            !recent_clean2.iter().any(|n| n.text.contains("ignored because")),
+            "clean call must not emit dropped alias notice: {recent_clean2:?}"
+        );
+    }
+
+    #[test]
+    fn batch_run_join_field_aliases_accepted_without_unrecognised_notice() {
+        let mut s = Session::new(crate::Project::default());
+        let mut ds_target = Dataset::new(
+            "Tracts",
+            rustgis_data::GeometryType::Point,
+            vec![rustgis_data::Field::new("GEOID", rustgis_data::FieldType::Text)],
+        );
+        ds_target.push_next(
+            Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))),
+            vec![rustgis_data::Value::Text("01".into())],
+        );
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, ds_target));
+
+        let mut ds_join =
+            Dataset::new("Census", rustgis_data::GeometryType::None, vec![rustgis_data::Field::new("FIPS", rustgis_data::FieldType::Text)]);
+        ds_join.push_next(None, vec![rustgis_data::Value::Text("01".into())]);
+        s.project.add_table(ds_join);
+
+        let mark = s.notices.len() as u64;
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "joinField",
+                    "inputs": ["Tracts"],
+                    "params": {
+                        "target_field": "GEOID",
+                        "join_table": "Census",
+                        "join_field": "FIPS",
+                        "duplicate_strategy": "First"
+                    }
+                }),
+            )
+            .unwrap();
+        assert_eq!(res["succeeded"], 1);
+        let recent = s.notices_since(mark);
+        assert!(
+            !recent.iter().any(|n| n.text.contains("unrecognised")),
+            "joinField aliases must not emit unrecognised parameter notice: {recent:?}"
         );
     }
 
