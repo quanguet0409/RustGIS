@@ -875,31 +875,26 @@ pub(crate) fn layer_name_left_out<'a>(command: &str, params: &'a Value) -> std::
     // Copied only when there is a name to leave out: other commands' parameters (a file's
     // contents, say) are read as they are.
     if command == "gp.batch" {
+        let has_builtin_plain_output = built_in()
+            && params.get("params").and_then(Value::as_object).and_then(|p| p.get("output")).and_then(Value::as_str).is_some_and(plain);
+        let has_null_folder = params.get("folder").is_some_and(Value::is_null);
+        let has_null_inputs = params.get("inputs").is_some_and(Value::is_null);
+
+        if !has_builtin_plain_output && !has_null_folder && !has_null_inputs {
+            return Cow::Borrowed(params);
+        }
+
         let mut out = params.clone();
-        let mut modified = false;
-        if built_in()
-            && let Some(p) = out.get_mut("params").and_then(Value::as_object_mut)
-            && p.get("output").and_then(Value::as_str).is_some_and(plain)
-            && p.remove("output").is_some()
-        {
-            modified = true;
+        if has_builtin_plain_output && let Some(p) = out.get_mut("params").and_then(Value::as_object_mut) {
+            p.remove("output");
         }
-        if out.get("folder").is_some_and(Value::is_null)
-            && let Some(obj) = out.as_object_mut()
-        {
+        if has_null_folder && let Some(obj) = out.as_object_mut() {
             obj.remove("folder");
-            modified = true;
         }
-        if out.get("inputs").is_some_and(Value::is_null)
-            && let Some(obj) = out.as_object_mut()
-        {
+        if has_null_inputs && let Some(obj) = out.as_object_mut() {
             obj.remove("inputs");
-            modified = true;
         }
-        if modified {
-            return Cow::Owned(out);
-        }
-        return Cow::Borrowed(params);
+        return Cow::Owned(out);
     }
     if command != "gp.run" || !built_in() || !named() {
         return Cow::Borrowed(params);
