@@ -1112,12 +1112,13 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         s.notify(format!("gp.batch: {dropped_inputs} invalid input(s) skipped (not a valid layer name or file path)"), false);
     }
 
-    if ps(p, "folder").is_some() && !targets.is_empty() {
+    if ps(p, "folder").is_some() && (is_wildcard || !targets.is_empty()) {
         s.notify("both 'inputs' and 'folder' were provided; running 'inputs' and ignoring 'folder'", false);
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     if targets.is_empty()
+        && !is_wildcard
         && let Some(folder) = ps(p, "folder").map(str::trim).filter(|f| !f.is_empty())
     {
         let dir = std::path::Path::new(folder);
@@ -4772,6 +4773,56 @@ mod batch_tests {
             .unwrap();
         let notices2 = &s2.notices[mark2..];
         assert!(!notices2.iter().any(|n| n.text.contains("raster layer(s)")));
+    }
+
+    #[test]
+    fn batch_run_wildcard_with_folder_on_raster_only_map_returns_wildcard_error_and_reads_no_files() {
+        use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+        let raster = Raster::new(
+            "Elevation",
+            2,
+            2,
+            vec![vec![0.0, 1.0, 2.0, 3.0]],
+            GeoTransform { origin_x: 0.0, origin_y: 0.0, pixel_width: 1.0, pixel_height: -1.0 },
+            Crs::LonLat,
+            None,
+            ColorHint::Gray,
+            "Float32",
+        )
+        .unwrap();
+
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_wc_folder_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let dummy_file = root.join("should_not_run.geojson");
+        std::fs::write(&dummy_file, b"{}").unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        s.map_mut().add_raster("Elevation", rustgis_map::RasterLayer::from_path(raster, "test.tif"));
+
+        let control = std::sync::Arc::new(rustgis_analysis::control::Control::new());
+        let res = run_batch_with(
+            &mut s,
+            &json!({
+                "tool": "buffer",
+                "inputs": "*",
+                "folder": root.display().to_string(),
+                "params": {"distance": 10}
+            }),
+            &control,
+        );
+
+        let err = res.unwrap_err();
+        assert!(err.contains("'*' matched no vector layers on the active map"));
+        assert!(s.notices.iter().any(|n| n.text.contains("both 'inputs' and 'folder' were provided")));
+        assert!(s.notices.iter().any(|n| n.text.contains("1 raster layer(s) left out of '*'")));
+        assert!(s.project.gp_history.is_empty(), "must read no files and run no tools");
+        assert_eq!(s.map().layers.len(), 1, "no layers added");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
