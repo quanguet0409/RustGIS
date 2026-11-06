@@ -1143,7 +1143,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
             .unwrap_or("input")
     });
 
-    if !spec.params.iter().any(|param| param.name == batch_param) {
+    if !rustgis_analysis::is_accepted_param(spec, batch_param) {
         return Err(format!("tool '{tool_id}' has no parameter '{batch_param}'"));
     }
 
