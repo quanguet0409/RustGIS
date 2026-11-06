@@ -1324,15 +1324,16 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
                         if let Value::Object(ref mut map) = rec_params {
                             map.insert(batch_param.to_string(), json!(target));
                         }
-                        let record_cmd = Some((
-                            "gp.batch".to_string(),
-                            json!({
-                                "tool": tool_id,
-                                "inputs": [target],
-                                "params": base_params,
-                                "param": batch_param,
-                            }),
-                        ));
+                        let mut record_json = json!({
+                            "tool": tool_id,
+                            "inputs": [target],
+                            "params": base_params,
+                            "param": batch_param,
+                        });
+                        if let Some(pat) = explicit_pattern {
+                            record_json["outputPattern"] = json!(pat);
+                        }
+                        let record_cmd = Some(("gp.batch".to_string(), record_json));
                         s.project.gp_history.push(
                             GpRecord {
                                 tool: name,
@@ -5356,6 +5357,46 @@ mod batch_tests {
         assert_eq!(rec2.params["input"], f2_str);
         assert!(rec2.messages.iter().any(|m| m.contains("environment's extent")));
         assert!(rec2.messages.iter().any(|m| m.contains("Z or M")));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn batch_run_read_failure_preserves_output_pattern_in_history() {
+        let root = std::env::temp_dir().join(format!(
+            "rustgis_batch_test_read_fail_{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let good = root.join("good.geojson");
+        let sample = r#"{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[1.0,2.0]},"properties":{}}]}"#;
+        std::fs::write(&good, sample).unwrap();
+
+        let bad = root.join("bad.geojson");
+        std::fs::write(&bad, "not-json").unwrap();
+
+        let mut s = Session::new(crate::Project::default());
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": [good.display().to_string(), bad.display().to_string()],
+                    "outputPattern": "{input}_custom_buf",
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+
+        assert_eq!(res["succeeded"], 1);
+        assert_eq!(res["failed"], 1);
+
+        assert_eq!(s.project.gp_history.len(), 2);
+        let bad_rec = &s.project.gp_history[1];
+        assert!(!bad_rec.ok);
+        let (_, replay_params) = bad_rec.command.as_ref().unwrap();
+        assert_eq!(replay_params["outputPattern"], "{input}_custom_buf");
 
         let _ = std::fs::remove_dir_all(root);
     }
