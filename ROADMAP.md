@@ -38,6 +38,8 @@ comment on its issue or pull request and open a draft pull request early.
   [#596](https://github.com/opengeos/RustGIS/issues/596)).
 - Georeferencer: side-by-side window, transform picker, more formats
   ([#609](https://github.com/opengeos/RustGIS/issues/609)).
+- Batch runs: one tool over many layers or a folder of files
+  ([#1458](https://github.com/opengeos/RustGIS/pull/1458)).
 
 ## Next
 
@@ -67,7 +69,6 @@ Correct, robust and recoverable, with the foundations other themes stand on.
 - Extend the OS keychain secret store to service connections (database passwords, S3 keys,
   AI provider keys and the ChatGPT sign-in's tokens are already kept there).
 - Vector tools, each writing a new layer: check and fix geometry _(open)_.
-- Batch runs: one tool over many layers or a folder of files.
 
 ### Expressions and cartography
 Next on top of the expression language:
