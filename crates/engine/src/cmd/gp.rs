@@ -1062,6 +1062,28 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         s.notify(format!("gp.batch: 'params.{batch_param}' is replaced by the batch inputs"), false);
     }
 
+    let declared: Vec<&str> = spec.params.iter().map(|param| param.name).collect();
+    let mut unknown: Vec<&str> = base_params
+        .as_object()
+        .into_iter()
+        .flat_map(|map| map.keys().map(String::as_str))
+        .filter(|key| {
+            if declared.contains(key) || *key == batch_param {
+                return false;
+            }
+            if spec.id == "joinField" {
+                !matches!(*key, "input" | "target_layer" | "join" | "source" | "join_table" | "join_field" | "join_key")
+            } else {
+                true
+            }
+        })
+        .collect();
+    if !unknown.is_empty() {
+        unknown.sort();
+        let sample = unknown.first().copied().unwrap_or_default();
+        s.notify(format!("gp.batch: {} unrecognised parameter(s) ignored in 'params' ({sample})", unknown.len()), false);
+    }
+
     // Collect inputs: from "inputs" array or single string, wildcard "*", or "folder" directory path.
     let mut targets: Vec<String> = Vec::new();
     let mut dropped_inputs = 0;
@@ -1702,7 +1724,6 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     let num_ok = succeeded.len();
     let num_err = failed.len();
     let attempted = num_ok + num_err + if interrupted_error.is_some() { 1 } else { 0 };
-    let total_count = if is_cancelled { attempted } else { targets.len() };
 
     let summary_msg = if is_cancelled {
         if let Some(err) = &interrupted_error {
@@ -1721,7 +1742,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
 
     let mut ret = json!({
         "tool": tool_id,
-        "total": total_count,
+        "total": targets.len(),
         "succeeded": num_ok,
         "failed": num_err,
         "layers": layer_ids,
@@ -1731,6 +1752,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     });
     if is_cancelled {
         ret["cancelled"] = json!(true);
+        ret["attempted"] = json!(attempted);
     }
 
     if !is_cancelled && num_ok == 0 {
@@ -3897,7 +3919,8 @@ mod batch_tests {
         )
         .unwrap();
 
-        assert_eq!(res["total"], 0);
+        assert_eq!(res["total"], 2);
+        assert_eq!(res["attempted"], 0);
         assert_eq!(res["succeeded"], 0);
         assert_eq!(res["failed"], 0);
         assert_eq!(res["cancelled"], true);
@@ -3946,14 +3969,15 @@ mod batch_tests {
         );
 
         let mut s = Session::new(crate::Project::default());
-        let ds = Dataset::new("L1", rustgis_data::GeometryType::Point, Vec::new());
-        s.map_mut().add_layer(rustgis_map::Layer::new(0, ds));
+        s.map_mut().add_layer(rustgis_map::Layer::new(0, Dataset::new("L1", rustgis_data::GeometryType::Point, Vec::new())));
+        s.map_mut().add_layer(rustgis_map::Layer::new(1, Dataset::new("L2", rustgis_data::GeometryType::Point, Vec::new())));
+        s.map_mut().add_layer(rustgis_map::Layer::new(2, Dataset::new("L3", rustgis_data::GeometryType::Point, Vec::new())));
 
         let res = run_batch_with(
             &mut s,
             &json!({
                 "tool": "test:cancel_item",
-                "inputs": ["L1"],
+                "inputs": ["L1", "L2", "L3"],
             }),
             &control,
         )
@@ -3961,14 +3985,17 @@ mod batch_tests {
 
         *CANCEL_CTL.lock().unwrap() = None;
 
+        assert_eq!(res["total"], 3);
+        assert_eq!(res["attempted"], 1);
         assert_eq!(res["failed"], 0);
         assert_eq!(res["succeeded"], 0);
         assert_eq!(res["cancelled"], true);
         assert_eq!(res["errors"].as_array().unwrap().len(), 1);
+        assert_eq!(res["errors"][0]["input"], "L1");
         assert_eq!(res["errors"][0]["error"], "Cancel Item Tool was cancelled");
         assert_eq!(res["errors"][0]["interrupted"], true);
         assert!(!s.notices.iter().any(|n| n.text.contains("failed")));
-        assert!(s.notices.iter().any(|n| n.text.contains("cancelled after 1 of 1 (Cancel Item Tool was cancelled)")));
+        assert!(s.notices.iter().any(|n| n.text.contains("cancelled after 1 of 3 (Cancel Item Tool was cancelled)")));
     }
 
     fn empty_output_runner(
@@ -4641,6 +4668,48 @@ mod batch_tests {
         assert!(
             !recent_clean.iter().any(|n| n.text.contains("unrecognised")),
             "clean call must not emit unrecognised option notice: {recent_clean:?}"
+        );
+    }
+
+    #[test]
+    fn batch_run_unrecognised_param_in_params_emits_notice() {
+        let mut s = test_session();
+        let mark = s.notices.len() as u64;
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "params": {"distanc": 50, "distance": 10}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res["succeeded"], 1);
+        let recent = s.notices_since(mark);
+        assert!(
+            recent.iter().any(|n| n.text.contains("1 unrecognised parameter(s) ignored in 'params' (distanc)")),
+            "recent notices: {recent:?}"
+        );
+
+        // Clean call emits no unrecognised notice
+        let mut s_clean = test_session();
+        let mark_clean = s_clean.notices.len() as u64;
+        let res_clean = s_clean
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "buffer",
+                    "inputs": ["Cities"],
+                    "params": {"distance": 10}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res_clean["succeeded"], 1);
+        let recent_clean = s_clean.notices_since(mark_clean);
+        assert!(
+            !recent_clean.iter().any(|n| n.text.contains("unrecognised")),
+            "clean call must not emit unrecognised notice: {recent_clean:?}"
         );
     }
 
