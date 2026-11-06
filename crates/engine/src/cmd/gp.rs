@@ -1899,6 +1899,9 @@ fn run_tool_internal(
     let inputs = match map_inputs(s, rustgis_analysis::tool(&tool), &params) {
         Ok(inputs) => inputs,
         Err(e) => {
+            if command.is_none() {
+                return Err(e);
+            }
             let spec = rustgis_analysis::tool(&tool);
             let name = spec.map(|t| t.name).unwrap_or("Tool").to_string();
             let millis = now_ms().saturating_sub(t0);
@@ -5492,6 +5495,20 @@ mod batch_tests {
         assert!(rec2.messages.iter().any(|m| m.contains("Z or M")));
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn run_missing_layer_returns_error_without_history_record() {
+        let mut s = Session::new(crate::Project::default());
+        let res = s.run(
+            "gp.run",
+            &json!({
+                "tool": "buffer",
+                "params": {"input": "NonExistentLayer", "distance": 10}
+            }),
+        );
+        assert!(res.is_err());
+        assert_eq!(s.project.gp_history.len(), 0);
     }
 
     #[test]
