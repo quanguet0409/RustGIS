@@ -38,8 +38,6 @@ comment on its issue or pull request and open a draft pull request early.
   [#596](https://github.com/opengeos/RustGIS/issues/596)).
 - Georeferencer: side-by-side window, transform picker, more formats
   ([#609](https://github.com/opengeos/RustGIS/issues/609)).
-- Batch runs: one tool over many layers or a folder of files
-  ([#1458](https://github.com/opengeos/RustGIS/pull/1458)).
 
 ## Next
 
