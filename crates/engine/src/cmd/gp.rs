@@ -1333,7 +1333,8 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         s.notify(format!("gp.batch: {dropped_inputs} invalid input(s) skipped (not a valid layer name or file path)"), false);
     }
 
-    if ps(p, "folder").is_some() && (is_wildcard || !targets.is_empty()) {
+    let folder_given = ps(p, "folder").is_some_and(|f| !f.trim().is_empty());
+    if folder_given && (is_wildcard || !targets.is_empty()) {
         s.notify("both 'inputs' and 'folder' were provided; running 'inputs' and ignoring 'folder'", false);
     }
 
@@ -1442,7 +1443,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
     }
 
     #[cfg(target_arch = "wasm32")]
-    if targets.is_empty() && ps(p, "folder").is_some() {
+    if targets.is_empty() && !is_wildcard && folder_given {
         return Err("folder batch runs are not supported in the browser; specify 'inputs' as an array of layers".into());
     }
 
@@ -1602,6 +1603,11 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
 
         let mut item_params = base_params.clone();
         if let Value::Object(ref mut map) = item_params {
+            // A tool reading the input under another name (Join Field's `input` for `target`) mustn't
+            // take a static value given under it in place of each batch input.
+            for alias in rustgis_analysis::param_aliases(spec, batch_param).iter().filter(|a| **a != batch_param) {
+                map.remove(*alias);
+            }
             map.insert(batch_param.to_string(), json!(target_layer_name));
             if tool_has_output {
                 map.insert("output".to_string(), json!(final_out_name));
@@ -1610,6 +1616,9 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
 
         let mut record_params = base_params.clone();
         if let Value::Object(ref mut map) = record_params {
+            for alias in rustgis_analysis::param_aliases(spec, batch_param).iter().filter(|a| **a != batch_param) {
+                map.remove(*alias);
+            }
             map.insert(batch_param.to_string(), json!(target));
             if tool_has_output {
                 map.insert("output".to_string(), json!(final_out_name));
@@ -1862,14 +1871,21 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         s.notify(format!("gp.batch: {trimmed_paths} file path(s) trimmed of surrounding whitespace"), false);
     }
 
+    // Every distinct message is named (a loss reported by the fourth kind must not be hidden),
+    // up to a bound a hostile run can't flood; all of them are in the result's `messages`.
+    const NAMED: usize = 50;
     if items_reporting_messages > 0 {
         let sample = distinct_tool_messages
             .iter()
-            .take(3)
+            .take(NAMED)
             .map(|(m, c)| if *c > 1 { format!("{m} (×{c})") } else { m.clone() })
             .collect::<Vec<_>>()
             .join("; ");
-        let more = if distinct_tool_messages.len() > 3 { format!(" and {} more", distinct_tool_messages.len() - 3) } else { String::new() };
+        let more = if distinct_tool_messages.len() > NAMED {
+            format!(" and {} more, in the result", distinct_tool_messages.len() - NAMED)
+        } else {
+            String::new()
+        };
         s.notify(format!("gp.batch: {items_reporting_messages} item(s) reported messages ({sample}{more})"), false);
     }
 
@@ -1943,6 +1959,7 @@ pub fn run_batch_with(s: &mut Session, p: &Value, control: &std::sync::Arc<rustg
         "outputs": output_names,
         "errors": errors,
         "warnings": warnings,
+        "messages": distinct_tool_messages.iter().map(|(m, c)| json!({"message": m, "items": c})).collect::<Vec<_>>(),
     });
     if is_cancelled {
         ret["cancelled"] = json!(true);
@@ -2100,7 +2117,7 @@ pub(crate) fn execute(
             let inputs = match map_inputs(s, Some(spec), params) {
                 Ok(inputs) => inputs,
                 // A batch item that can't read its input is kept in the history as a failed run.
-                Err(e) if opts.command.is_some() => return apply_with(s, run_of(t0), kept(), Err(e), now_ms().saturating_sub(t0), opts),
+                Err(e) if opts.record.is_some() => return apply_with(s, run_of(t0), kept(), Err(e), now_ms().saturating_sub(t0), opts),
                 Err(e) => return Err(e),
             };
             let mut res = if let Some(plugin) = pin.plugin() {
@@ -5229,6 +5246,66 @@ mod batch_tests {
             !recent.iter().any(|n| n.text.contains("unrecognised")),
             "joinField aliases must not emit unrecognised parameter notice: {recent:?}"
         );
+    }
+
+    #[test]
+    fn batch_input_takes_precedence_over_a_static_alias() {
+        let mut s = Session::new(crate::Project::default());
+        for (i, name) in ["Tracts", "Blocks", "Other"].into_iter().enumerate() {
+            let mut ds = Dataset::new(
+                name,
+                rustgis_data::GeometryType::Point,
+                vec![rustgis_data::Field::new("GEOID", rustgis_data::FieldType::Text)],
+            );
+            ds.push_next(
+                Some(rustgis_data::Geometry::Point(rustgis_geom::Coord::new(0.0, 0.0))),
+                vec![rustgis_data::Value::Text("01".into())],
+            );
+            s.map_mut().add_layer(rustgis_map::Layer::new(i as u32, ds));
+        }
+        let mut join =
+            Dataset::new("Census", rustgis_data::GeometryType::None, vec![rustgis_data::Field::new("FIPS", rustgis_data::FieldType::Text)]);
+        join.push_next(None, vec![rustgis_data::Value::Text("01".into())]);
+        s.project.add_table(join);
+        let before = s.project.gp_history.len();
+        let res = s
+            .run(
+                "gp.batch",
+                &json!({
+                    "tool": "joinField",
+                    "inputs": ["Tracts", "Blocks"],
+                    "param": "target_layer",
+                    // `input` names Join Field's target too: it must not stand in for each batch input.
+                    "params": {"input": "Other", "targetField": "GEOID", "joinTable": "Census", "joinField": "FIPS"}
+                }),
+            )
+            .unwrap();
+        assert_eq!(res["succeeded"], 2, "{res}");
+        let targets: Vec<_> = s.project.gp_history[before..].iter().map(|r| r.params["target_layer"].clone()).collect();
+        assert_eq!(targets, [json!("Tracts"), json!("Blocks")]);
+        assert!(s.project.gp_history[before..].iter().all(|r| r.params.get("input").is_none()));
+        let other = s.map().layer_by_name("Other").unwrap();
+        assert!(!other.dataset.fields.iter().any(|f| f.name == "FIPS"), "the static alias's layer was joined");
+    }
+
+    #[test]
+    fn batch_item_whose_input_cant_be_read_is_kept_in_the_history() {
+        let mut s = test_session();
+        let before = s.project.gp_history.len();
+        // A name that is neither a layer, a table nor a file: the tool's input can't be mapped.
+        let res = s.run("gp.batch", &json!({"tool": "buffer", "inputs": ["Cities", "Nowhere"], "params": {"distance": 1}})).unwrap();
+        assert_eq!(res["failed"], 1, "{res}");
+        let failed: Vec<_> = s.project.gp_history[before..].iter().filter(|r| !r.ok).collect();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].params["input"], "Nowhere");
+    }
+
+    #[test]
+    fn blank_folder_beside_inputs_is_not_reported() {
+        let mut s = test_session();
+        let mark = s.notices.len() as u64;
+        s.run("gp.batch", &json!({"tool": "buffer", "inputs": ["Cities"], "folder": "  ", "params": {"distance": 1}})).unwrap();
+        assert!(!s.notices_since(mark).iter().any(|n| n.text.contains("both 'inputs' and 'folder'")));
     }
 
     #[test]
