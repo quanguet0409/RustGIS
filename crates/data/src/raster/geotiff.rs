@@ -41,6 +41,12 @@ struct Geo {
     referenced: bool,
 }
 
+/// Whether the first sample past the colour ones is declared alpha (extra sample 1, associated, or
+/// 2, unassociated).
+pub(super) fn extra_alpha<R: Read + Seek>(dec: &mut Decoder<R>) -> bool {
+    dec.find_tag_unsigned_vec::<u16>(Tag::ExtraSamples).ok().flatten().is_some_and(|v| matches!(v.first(), Some(1 | 2)))
+}
+
 /// How `n` samples of a grey image the decoder calls multiband are shown: grey with alpha when
 /// there are two and the second is declared alpha (extra sample 1, associated, or 2, unassociated),
 /// else grey. GDAL marks the second band of an ordinary two-band file as 0, unspecified data.
@@ -66,6 +72,22 @@ fn geo_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Geo> {
     // A projected file with a user-defined projection (the NLCD's Albers, say) defines it in its
     // keys: read as its own system, never as the geographic system it's based on.
     let user_defined = key(1024) == Some(1) && key(3072).is_none_or(|c| !usable(&c));
+    let citation = |k: u16| match geokey(&keys, &gdoubles, &gascii, k) {
+        Some(KeyValue::Ascii(t)) if !t.trim().is_empty() => Some(t),
+        _ => None,
+    };
+    // PCSCitation, else GTCitation.
+    let system = || citation(3073).or_else(|| citation(1026)).unwrap_or_else(|| "the file's own projection".into());
+    // A projection of another body's planetographic longitude/latitude is refused when a citation
+    // says so, as GDAL names one. GeoTIFF has no key for axis directions, and PROJ gives such a
+    // projection westings.
+    if user_defined
+        && planetary_axes(&keys, &gdoubles, &gascii).is_some()
+        // PCSCitation, GTCitation, GeogCitation.
+        && [3073, 1026, 2049].into_iter().filter_map(citation).any(|t| super::planetary::ographic_name(&t))
+    {
+        return Err(err(super::planetary::refused(&system(), super::planetary::OGRAPHIC_PROJECTED)));
+    }
     // A projection the keys don't describe well enough is left unknown (the open goes on, and fails
     // later only if the coordinates aren't degrees), its reason kept for the message.
     let mut custom_error = None;
@@ -81,6 +103,19 @@ fn geo_tags<R: Read + Seek>(dec: &mut Decoder<R>) -> Result<Geo> {
         let code = key(3072).filter(usable).or(key(2048).filter(usable)).map(u32::from);
         (code, code.and_then(Crs::from_epsg))
     };
+    // Another body's system ([`super::planetary`]). A geographic one is its own system, not WGS 84:
+    // its longitude/latitude are read as they are, and a GeoTIFF written from it keeps its keys.
+    // A projection of it that can't be read is refused, because its metres would be read as
+    // degrees.
+    let crs = match crs {
+        None if geographic_model && key(2048).is_none_or(|c| !usable(&c)) => planetary_geographic(&keys, &gdoubles, &gascii)?.or(crs),
+        crs => crs,
+    };
+    if let Some(e) = &custom_error
+        && planetary_axes(&keys, &gdoubles, &gascii).is_some()
+    {
+        return Err(err(super::planetary::refused(&system(), e.strip_prefix("GeoTIFF: ").unwrap_or(e))));
+    }
 
     // A TIFF with none of the GeoTIFF tags is a scan; one with only some of them is damaged.
     let tagless = keys.is_empty() && [33550u16, 33922, 34264].iter().all(|t| dec.find_tag(Tag::Unknown(*t)).ok().flatten().is_none());
@@ -224,6 +259,103 @@ fn geokey(keys: &[u16], doubles: &[f64], ascii: &str, k: u16) -> Option<KeyValue
     }
 }
 
+/// Metres per unit of the ellipsoid's axes in a file's keys (GeogLinearUnits, metres when it isn't
+/// given). `a` is the semi-major axis as the keys give it. When that is already the Earth's in
+/// metres, the factor is 1, because some writers give metres whatever unit they declare. `None`
+/// for a unit the keys don't size.
+fn axis_unit(keys: &[u16], doubles: &[f64], ascii: &str, a: f64) -> Option<f64> {
+    if !super::planetary::off_earth(a) {
+        return Some(1.0);
+    }
+    // GeogLinearUnits
+    match geokey(keys, doubles, ascii, 2052) {
+        None | Some(KeyValue::Short(9001)) => Some(1.0),      // metre
+        Some(KeyValue::Short(9002)) => Some(0.3048),          // foot
+        Some(KeyValue::Short(9003)) => Some(1200.0 / 3937.0), // US survey foot
+        Some(KeyValue::Short(9036)) => Some(1000.0),          // kilometre
+        // GeogLinearUnitSize
+        _ => match geokey(keys, doubles, ascii, 2053) {
+            Some(KeyValue::Double(f)) if f.is_finite() && f > 0.0 => Some(f),
+            _ => None,
+        },
+    }
+}
+
+/// The semi-major and semi-minor axes, in metres, of the ellipsoid a file's keys give by its axes
+/// (GeogSemiMajorAxis with GeogSemiMinorAxis or GeogInvFlattening, in GeogLinearUnits), when it is
+/// another body's than the Earth's ([`super::planetary`]).
+fn planetary_axes(keys: &[u16], doubles: &[f64], ascii: &str) -> Option<(f64, f64)> {
+    let num = |k| match geokey(keys, doubles, ascii, k) {
+        Some(KeyValue::Double(v)) if v.is_finite() && v > 0.0 => Some(v),
+        _ => None,
+    };
+    let raw = num(2057)?; // GeogSemiMajorAxis
+    let to_m = axis_unit(keys, doubles, ascii, raw)?;
+    let a = raw * to_m;
+    // GeogSemiMinorAxis, GeogInvFlattening
+    let b = match (num(2058), num(2059)) {
+        (Some(b), _) => b * to_m,
+        (None, Some(rf)) => a - a / rf,
+        (None, None) => a,
+    };
+    super::planetary::off_earth(a).then_some((a, b))
+}
+
+/// A geographic file's own system when it is another body's: its ellipsoid by its axes, named by
+/// its citation (`GCS Name = Mars (2015) - Sphere / Ocentric|…`), with the keys it came in. `None`
+/// for the Earth's. It is an error when its cells would land in the wrong place as
+/// longitude/latitude in degrees:
+/// - a planetographic system, told by its citation as GDAL names an IAU `…01` system (GeoTIFF has
+///   no key for longitudes counted west);
+/// - other angular units than degrees.
+fn planetary_geographic(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<Option<Crs>> {
+    let Some((a, b)) = planetary_axes(keys, doubles, ascii) else { return Ok(None) };
+    // GeogCitation
+    let citation = match geokey(keys, doubles, ascii, 2049) {
+        Some(KeyValue::Ascii(t)) => t,
+        _ => String::new(),
+    };
+    let first = citation.split('|').next().unwrap_or("");
+    let label = match first.trim().strip_prefix("GCS Name =").unwrap_or(first).trim() {
+        "" => format!("Geographic coordinate system (semi-major axis {a} m)"),
+        name => name.to_string(),
+    };
+    if super::planetary::ographic_name(first) {
+        return Err(err(super::planetary::refused(&label, super::planetary::OGRAPHIC)));
+    }
+    let degree = |f: f64| (f - 1f64.to_radians()).abs() < 1e-12;
+    // GeogAngularUnits
+    let unit = match geokey(keys, doubles, ascii, 2054) {
+        // Degrees, the default (9102); 9122 is the degree "supplier to define representation".
+        None | Some(KeyValue::Short(9102 | 9122)) => None,
+        // User-defined, sized by GeogAngularUnitSize in radians.
+        Some(KeyValue::Short(32767)) => match geokey(keys, doubles, ascii, 2055) {
+            Some(KeyValue::Double(f)) if degree(f) => None,
+            Some(KeyValue::Double(f)) => Some(format!("units of {f} radians")),
+            _ => Some("a user-defined unit of no size".to_string()),
+        },
+        Some(KeyValue::Short(code)) => Some(format!("GeogAngularUnits {code}")),
+        Some(_) => Some("an unreadable GeogAngularUnits".to_string()),
+    };
+    if let Some(unit) = unit {
+        let why = format!("its longitude/latitude are in {unit}, not degrees");
+        return Err(err(super::planetary::refused(&label, &why)));
+    }
+    // A prime meridian other than the body's reference one, in degrees (GeogPrimeMeridianLong).
+    let pm = match geokey(keys, doubles, ascii, 2061) {
+        Some(KeyValue::Double(pm)) if pm.is_finite() && pm != 0.0 => format!(" +pm={pm}"),
+        _ => String::new(),
+    };
+    let def = CustomCrs {
+        proj4: format!("+proj=longlat +a={a} +b={b}{pm} +no_defs"),
+        label,
+        geokeys: keys.to_vec(),
+        doubles: doubles.to_vec(),
+        ascii: ascii.to_string(),
+    };
+    Crs::custom(def).map(Some).map_err(err)
+}
+
 /// A user-defined projection from a file's GeoKeys, as a PROJ definition.
 fn custom_crs(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<Crs> {
     let (proj4, label) = proj4_of_keys(keys, doubles, ascii)?;
@@ -284,16 +416,30 @@ fn proj4_of_keys(keys: &[u16], doubles: &[f64], ascii: &str) -> Result<(String, 
         Some(c) => return Err(err(format!("the file's own projection (coordinate transformation {c}) isn't supported"))),
         None => return Err(err("the file's own projection isn't described in its keys")),
     };
-    // The datum or ellipsoid, by code or by its axes.
+    // The datum or ellipsoid, by code or by its axes, in metres.
     let earth = match (short(2048), short(2050), short(2056)) {
         (Some(4326), _, _) | (_, Some(6326), _) | (_, _, Some(7030)) => "+datum=WGS84".to_string(),
         (Some(4269), _, _) | (_, Some(6269), _) | (_, _, Some(7019)) => "+ellps=GRS80 +towgs84=0,0,0".to_string(),
         (Some(4267), _, _) | (_, Some(6267), _) | (_, _, Some(7008)) => "+ellps=clrk66".to_string(),
-        _ => match (num(2057), num(2059), num(2058)) {
-            (Some(a), Some(rf), _) if a > 0.0 && rf > 0.0 => format!("+a={a} +rf={rf}"),
-            (Some(a), _, Some(b)) if a > 0.0 && b > 0.0 => format!("+a={a} +b={b}"),
-            _ => "+datum=WGS84".to_string(),
-        },
+        _ => {
+            // Axes in a unit the keys don't size can't be taken for metres: the ellipsoid, and so
+            // every cell, would be another size.
+            let axis_m = match num(2057) {
+                Some(a) => axis_unit(keys, doubles, ascii, a).ok_or_else(|| {
+                    let unit = short(2052).map(|u| format!(" (GeogLinearUnits {u})")).unwrap_or_default();
+                    err(format!("the file's ellipsoid axes are in a unit{unit} that isn't supported"))
+                })?,
+                None => 1.0,
+            };
+            match (num(2057).map(|a| a * axis_m), num(2059), num(2058).map(|b| b * axis_m)) {
+                (Some(a), Some(rf), _) if a > 0.0 && rf > 0.0 => format!("+a={a} +rf={rf}"),
+                (Some(a), _, Some(b)) if a > 0.0 && b > 0.0 => format!("+a={a} +b={b}"),
+                // Another body's sphere (no flattening, or 0): not WGS 84, which would read its
+                // metres as the Earth's ([`super::planetary`]).
+                (Some(a), rf, None) if super::planetary::off_earth(a) && rf.is_none_or(|rf| rf == 0.0) => format!("+a={a} +b={a}"),
+                _ => "+datum=WGS84".to_string(),
+            }
+        }
     };
     let label = text(3073).or_else(|| text(1026)).filter(|t| !t.trim().is_empty()).unwrap_or_else(|| "Custom projection".into());
     Ok((format!("{proj} {earth} {units} +no_defs"), label))
@@ -567,15 +713,22 @@ fn samples<R: Read + Seek>(dec: &mut Decoder<R>) -> usize {
     dec.find_tag_unsigned::<u16>(Tag::SamplesPerPixel).ok().flatten().unwrap_or(1).max(1) as usize
 }
 
-/// A reader that shows palette images as grey ones: the `tiff` crate decodes no palette images, but
-/// decodes their colour indices as grey samples, and the colour table is read from the ColorMap tag
-/// as it is. The only change is the PhotometricInterpretation value (3 → 1) in each image's IFD.
+/// A reader that shows palette images, and RGB images with samples past the colour ones, as grey
+/// ones: the `tiff` crate decodes no palette images, but decodes their colour indices as grey
+/// samples, and the colour table is read from the ColorMap tag as it is. An RGB image with an
+/// unspecified fourth sample (RGBI) decoded as RGB loses that sample before the predictor is
+/// undone, corrupting the colours (https://github.com/image-rs/image-tiff/issues/425); as grey,
+/// every sample is decoded. The only change is the PhotometricInterpretation value (→ 1) in each
+/// such image's IFD, in memory.
 pub(crate) struct Unpaletted<R> {
     inner: R,
-    /// Where each palette image's PhotometricInterpretation value is, and what to show there.
+    /// Where each patched image's PhotometricInterpretation value is, and what to show there.
     patches: Vec<(u64, [u8; 2])>,
     /// Whether the first image (the full one) is a palette image.
     first_palette: bool,
+    /// Whether the first image is an RGB image with samples past the colour ones (shown to the
+    /// decoder as grey): its first three samples are red, green and blue, every sample read.
+    first_wide_rgb: bool,
     pos: u64,
 }
 
@@ -583,13 +736,16 @@ pub(crate) struct Unpaletted<R> {
 const MAX_IFDS: usize = 64;
 const MAX_ENTRIES: u64 = 4096;
 
-/// Where the palette images' PhotometricInterpretation values are, walking the IFD chain
-/// (classic and BigTIFF). A file it can't walk has none: the decoder reports what's wrong.
-fn palette_patches<R: Read + Seek>(r: &mut R) -> (Vec<(u64, [u8; 2])>, bool) {
+/// Where the palette images' PhotometricInterpretation values are, and those of RGB images with
+/// samples past the colour ones (which the decoder would leave out, or refuse), walking the IFD
+/// chain (classic and BigTIFF). A file it can't walk has none: the decoder reports what's wrong.
+/// Returns the patches, whether the first image is a palette image, and whether it is such an RGB
+/// image.
+fn palette_patches<R: Read + Seek>(r: &mut R) -> (Vec<(u64, [u8; 2])>, bool, bool) {
     use std::io::SeekFrom;
     let mut patches = Vec::new();
-    // Whether the first image is one of them.
-    let mut first = false;
+    // Whether the first image is one of them, and whether it is an RGB image with more samples.
+    let (mut first, mut first_wide) = (false, false);
     let mut walk = || -> Option<()> {
         let mut head = [0u8; 16];
         r.seek(SeekFrom::Start(0)).ok()?;
@@ -636,16 +792,35 @@ fn palette_patches<R: Read + Seek>(r: &mut R) -> (Vec<(u64, [u8; 2])>, bool) {
             }
             let mut entries = vec![0u8; usize::try_from(n * entry_len).ok()?];
             r.read_exact(&mut entries).ok()?;
+            let value_at = if big { 12 } else { 8 };
+            let grey = if little { [1, 0] } else { [0, 1] };
+            // PhotometricInterpretation (262): where its value is, and the value; SamplesPerPixel
+            // (277); the first ExtraSamples (338) value, when it is inline. Each a SHORT, as the
+            // decoder itself requires of them.
+            let (mut photometric, mut samples, mut extra) = (None, 1u16, None);
             for (i, e) in entries.chunks(entry_len as usize).enumerate() {
-                // PhotometricInterpretation (262), a SHORT, its value inline.
-                if u16_(e)? == 262 && u16_(e.get(2..)?)? == 3 {
-                    let value_at = if big { 12 } else { 8 };
-                    if u16_(e.get(value_at..)?)? == 3 {
-                        let at = ifd + count_len + i as u64 * entry_len + value_at as u64;
-                        patches.push((at, if little { [1, 0] } else { [0, 1] }));
-                        first |= k == 0;
+                let short = u16_(e.get(2..)?)? == 3;
+                match u16_(e)? {
+                    262 if short => {
+                        photometric = Some((ifd + count_len + i as u64 * entry_len + value_at as u64, u16_(e.get(value_at..)?)?))
                     }
+                    277 if short => samples = u16_(e.get(value_at..)?)?,
+                    338 if short => extra = u16_(e.get(value_at..)?),
+                    _ => {}
                 }
+            }
+            match photometric {
+                Some((at, 3)) => {
+                    patches.push((at, grey));
+                    first |= k == 0;
+                }
+                // An RGB image whose fourth sample isn't alpha, or with five or more: RGBI
+                // orthophotos, multispectral images.
+                Some((at, 2)) if samples > 4 || (samples == 4 && !matches!(extra, Some(1 | 2))) => {
+                    patches.push((at, grey));
+                    first_wide |= k == 0;
+                }
+                _ => {}
             }
             let mut next = [0u8; 8];
             r.read_exact(&mut next[..next_len]).ok()?;
@@ -654,7 +829,7 @@ fn palette_patches<R: Read + Seek>(r: &mut R) -> (Vec<(u64, [u8; 2])>, bool) {
         Some(())
     };
     let _ = walk();
-    (patches, first)
+    (patches, first, first_wide)
 }
 
 /// Any reader, boxed: the decoder is compiled once for every kind of source (a file, bytes in
@@ -676,13 +851,18 @@ impl<R> Unpaletted<R> {
     pub(crate) fn first_is_palette(&self) -> bool {
         self.first_palette
     }
+
+    /// Whether the first image is an RGB image with more samples than its colours.
+    pub(crate) fn first_is_wide_rgb(&self) -> bool {
+        self.first_wide_rgb
+    }
 }
 
 impl<R: Read + Seek> Unpaletted<R> {
     fn new(mut inner: R) -> std::io::Result<Self> {
-        let (patches, first_palette) = palette_patches(&mut inner);
+        let (patches, first_palette, first_wide_rgb) = palette_patches(&mut inner);
         inner.seek(std::io::SeekFrom::Start(0))?;
-        Ok(Unpaletted { inner, patches, first_palette, pos: 0 })
+        Ok(Unpaletted { inner, patches, first_palette, first_wide_rgb, pos: 0 })
     }
 }
 
@@ -1026,6 +1206,7 @@ pub(super) fn read_limited_with_nodata(
     // COG window has it: a grey full image's stray colour table colours nothing, nor do palette
     // overviews of it.
     let palette = r.first_is_palette();
+    let wide_rgb = r.first_is_wide_rgb();
     let limits = {
         let mut l = Limits::default();
         l.decoding_buffer_size = max_samples().saturating_mul(4);
@@ -1078,7 +1259,9 @@ pub(super) fn read_limited_with_nodata(
             }
             let Ok((ow, oh)) = dec.dimensions() else { continue };
             let (ospp, obytes) = (samples(&mut dec), sample_bytes(&mut dec));
-            if fits(ow, oh, ospp, obytes) && best.is_none_or(|(_, bw, bh)| ow as u64 * oh as u64 > bw as u64 * bh as u64) {
+            // An overview with another sample count (three of an RGBI image's four) would read
+            // as another kind of image: the full image is read sparsely instead.
+            if ospp == spp && fits(ow, oh, ospp, obytes) && best.is_none_or(|(_, bw, bh)| ow as u64 * oh as u64 > bw as u64 * bh as u64) {
                 best = Some((index, ow, oh));
             }
         }
@@ -1162,15 +1345,19 @@ pub(super) fn read_limited_with_nodata(
             };
             (1, table.map_or(ColorHint::Gray, ColorHint::Palette))
         }
+        // An RGB image with more bands (shown to the decoder as grey, see `Unpaletted`): every
+        // band, the first three red, green and blue.
+        ColorType::Multiband { num_samples, .. } if wide_rgb && num_samples >= 3 => {
+            (num_samples as usize, ColorHint::Rgb { alpha: extra_alpha(&mut dec) })
+        }
         ColorType::Multiband { num_samples, .. } => (num_samples.max(1) as usize, multiband_color(&mut dec, num_samples)),
         other => return Err(err(format!("{other:?} images aren't supported"))),
     };
     let planar = dec.find_tag_unsigned::<u16>(Tag::PlanarConfiguration).ok().flatten() == Some(2);
     let n = (w as usize) * (h as usize);
-    // The decoder leaves out samples past the colour ones (RGB with an undefined fourth band, as
-    // in RGBI orthophotos) a tile row at a time, and writes a padded edge tile's whole width into
-    // the image: past its edge, over the start of the next row (issue #162). Such tiled images
-    // are read a tile at a time, as their chunks come back only as wide as the image.
+    // Extra samples the decoder leaves out can make padded edge tiles spill into the next row
+    // when read whole (issue #162). Read those tile by tile. An RGBI image the patched reader
+    // shows as grey (see `Unpaletted`) keeps its fourth sample and doesn't need this.
     let tile_rows = dec.find_tag_unsigned::<u32>(Tag::TileLength).ok().flatten();
     let tiled = dec.find_tag_unsigned::<u32>(Tag::TileWidth).ok().flatten().is_some();
     let extra_samples = !planar && samples(&mut dec) > nbands && tiled;
@@ -1308,6 +1495,7 @@ pub(super) fn read_limited_with_nodata(
     let mut r = Raster::new(name, w, h, bands, transform, crs, geo.nodata, color, data_type)?;
     r.overview = overview;
     r.rounded = rounded;
+    r.lost.extend(super::planetary::note_of(crs));
     r.lost.extend(table_lost);
     if let Some(p) = &described {
         r.apply_pam(p, super::pam::GDAL_METADATA);
@@ -1373,19 +1561,14 @@ pub(super) fn fits_bytes(r: &Raster, b: usize) -> bool {
     nodata_ok && (whole_bytes || s.count == 0)
 }
 
-/// The bands [`write`] writes of `r` given `band`: an RGB raster's colour bands (with a fourth as
-/// alpha when they are bytes and it is too, or when the raster says it is alpha), otherwise `band`
-/// alone.
+/// The bands [`write`] writes of `r` given `band`: RGB and its fourth sample (alpha only when
+/// declared alpha), otherwise `band` alone.
 pub fn written_bands(r: &Raster, band: usize) -> Vec<usize> {
     if !(matches!(r.color, ColorHint::Rgb { .. }) && r.bands.len() >= 3) {
         return vec![band];
     }
-    let alpha = if (0..3).all(|b| fits_bytes(r, b)) {
-        r.bands.len() >= 4 && fits_bytes(r, 3)
-    } else {
-        r.bands.len() >= 4 && matches!(r.color, ColorHint::Rgb { alpha: true })
-    };
-    (0..if alpha { 4 } else { 3 }).collect()
+    let fourth = r.bands.len() == 4 || (r.bands.len() > 4 && matches!(r.color, ColorHint::Rgb { alpha: true }));
+    (0..if fourth { 4 } else { 3 }).collect()
 }
 
 /// Writes a raster as a Deflate-compressed GeoTIFF: a colour raster's colour bands (RGB(A) bytes
@@ -1452,6 +1635,13 @@ fn encode(r: &Raster, band: usize) -> Result<Vec<u8>> {
         ($img:expr, $written:expr) => {{
             let classes = super::gdal_metadata_of(r, $written);
             let e = $img.encoder();
+            // The fourth sample says what it is: unassociated alpha (2) or data (0, as RGB and
+            // near-infrared). The encoder writes no ExtraSamples tag, and without one a reader
+            // can't tell alpha from data.
+            if $written.len() == 4 && rgb {
+                let extra: u16 = if matches!(r.color, ColorHint::Rgb { alpha: true }) { 2 } else { 0 };
+                e.write_tag(Tag::ExtraSamples, &[extra][..]).map_err(err)?;
+            }
             e.write_tag(Tag::ModelPixelScaleTag, &scale[..]).map_err(err)?;
             e.write_tag(Tag::ModelTiepointTag, &tie[..]).map_err(err)?;
             e.write_tag(Tag::GeoKeyDirectoryTag, &keys[..]).map_err(err)?;
@@ -1471,7 +1661,16 @@ fn encode(r: &Raster, band: usize) -> Result<Vec<u8>> {
             }
         }};
     }
-    if rgb && let (Some(red), Some(green), Some(blue)) = (bytes(0), bytes(1), bytes(2)) {
+    // Without alpha or a no-data marker, byte samples cannot keep NaN holes (for example the
+    // cells outside a reprojected RGBI image). Keep those samples as floats instead.
+    let byte_holes = r.nodata.is_none()
+        && matches!(r.color, ColorHint::Rgb { alpha: false })
+        && written_bands(r, band).iter().any(|b| r.bands.get(*b).is_some_and(|b| b.stats.count < (w as usize) * (h as usize)));
+    if rgb
+        && !byte_holes
+        && (!written_bands(r, band).contains(&3) || fits_bytes(r, 3))
+        && let (Some(red), Some(green), Some(blue)) = (bytes(0), bytes(1), bytes(2))
+    {
         let alpha = if written_bands(r, band).contains(&3) { bytes(3) } else { None };
         let n = (w as usize) * (h as usize);
         if let Some(a) = alpha {
@@ -1626,6 +1825,41 @@ mod tests {
         assert_eq!(back.color, ColorHint::Rgb { alpha: false });
         assert_eq!(back.value(2, 1, 0), Some(60.0));
         assert_eq!(back.data_type, "UInt8");
+    }
+
+    /// An RGBA export declares its fourth sample alpha, so it reads back as alpha, not as RGB and a
+    /// data band (bytes and floats alike).
+    #[test]
+    fn rgba_export_reads_back_with_alpha() {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 2.0, pixel_width: 1.0, pixel_height: -1.0 };
+        for (dt, factor) in [("UInt8", 1.0), ("Float32", 0.01)] {
+            let bands: Vec<Vec<f32>> = [200.0, 100.0, 50.0, 255.0].iter().map(|v| vec![v * factor; 4]).collect();
+            let r = Raster::new("rgba", 2, 2, bands, gt, Crs::LonLat, None, ColorHint::Rgb { alpha: true }, dt).unwrap();
+            let back = read(std::io::Cursor::new(write(&r, 0).unwrap()), "rgba").unwrap();
+            assert_eq!((back.band_count(), back.color.clone()), (4, ColorHint::Rgb { alpha: true }), "{dt}");
+        }
+    }
+
+    #[test]
+    fn rgbi_byte_export_does_not_turn_nir_into_alpha() {
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 2.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let r = Raster::new(
+            "rgbi",
+            2,
+            2,
+            vec![vec![200.0; 4], vec![100.0; 4], vec![50.0; 4], vec![0.0; 4]],
+            gt,
+            Crs::LonLat,
+            None,
+            ColorHint::Rgb { alpha: false },
+            "UInt8",
+        )
+        .unwrap();
+        assert_eq!(written_bands(&r, 0), vec![0, 1, 2, 3]);
+        let back = read(std::io::Cursor::new(write(&r, 0).unwrap()), "rgb").unwrap();
+        assert_eq!((back.band_count(), back.color.clone()), (4, ColorHint::Rgb { alpha: false }));
+        assert_eq!(back.value(0, 0, 0), Some(200.0));
+        assert_eq!(back.value(3, 0, 0), Some(0.0));
     }
 
     /// An Equi7 tile (a Sentinel-1 product on TU Wien's grid, say) names its system by its EPSG
@@ -1997,43 +2231,64 @@ mod tests {
     /// it. Sample `b` of pixel (x, y) at a `k`-times overview is `pixel(b, x·k, y·k)`; edge tiles
     /// are padded with zeros.
     fn rgbi_tiled(images: &[(u32, u32)], pixel: impl Fn(u32, u32, u32) -> u8) -> Vec<u8> {
+        rgbi_tiled_encoded(images, 8, 1, |b, x, y| u16::from(pixel(b, x, y)))
+    }
+
+    fn rgbi_tiled_encoded(images: &[(u32, u32)], bits: u16, predictor: u16, pixel: impl Fn(u32, u32, u32) -> u16) -> Vec<u8> {
+        rgb_tiled_samples(&images.iter().map(|&(size, tile)| (size, tile, 4)).collect::<Vec<_>>(), bits, predictor, pixel)
+    }
+
+    fn rgb_tiled_samples(images: &[(u32, u32, u16)], bits: u16, predictor: u16, pixel: impl Fn(u32, u32, u32) -> u16) -> Vec<u8> {
         let full = images.first().map_or(1, |i| i.0);
         let mut out = vec![b'I', b'I', 42, 0, 0, 0, 0, 0];
         let mut next_link = 4;
-        for (i, &(size, tile)) in images.iter().enumerate() {
+        for (i, &(size, tile, samples)) in images.iter().enumerate() {
             let k = full / size;
             let n = size.div_ceil(tile);
             // The tiles' data first, then the IFD pointing at it.
             let mut offsets = Vec::new();
+            let mut counts = Vec::new();
             for t in 0..n * n {
                 offsets.push(out.len() as u32);
-                for p in 0..tile * tile {
-                    let (x, y) = ((t % n) * tile + p % tile, (t / n) * tile + p / tile);
-                    for b in 0..4 {
-                        out.push(if x < size && y < size { pixel(b, x * k, y * k) } else { 0 });
+                let mut raw = Vec::new();
+                for y in 0..tile {
+                    let mut prev = [0u16; 4];
+                    for x in 0..tile {
+                        let (x, y) = ((t % n) * tile + x, (t / n) * tile + y);
+                        for b in 0..u32::from(samples) {
+                            let value = if x < size && y < size { pixel(b, x * k, y * k) } else { 0 };
+                            let encoded = if predictor == 2 { value.wrapping_sub(prev[b as usize]) } else { value };
+                            prev[b as usize] = value;
+                            raw.extend_from_slice(&encoded.to_le_bytes()[..usize::from(bits / 8)]);
+                        }
                     }
                 }
+                let encoded = if predictor == 1 { raw } else { miniz_oxide::deflate::compress_to_vec_zlib(&raw, 6) };
+                counts.push(encoded.len() as u32);
+                out.extend(encoded);
             }
             // Out-of-line values: (tag, type, count, bytes); type 3 short, 4 long, 12 double.
             let shorts = |v: &[u16]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
             let longs = |v: &[u32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
             let doubles = |v: &[f64]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
-            let counts = vec![tile * tile * 4; offsets.len()];
             let mut e: Vec<(u16, u16, u32, Vec<u8>)> = vec![
                 (254, 4, 1, longs(&[u32::from(i > 0)])),
                 (256, 4, 1, longs(&[size])),
                 (257, 4, 1, longs(&[size])),
-                (258, 3, 4, shorts(&[8; 4])),
-                (259, 3, 1, shorts(&[1])),
+                (258, 3, u32::from(samples), shorts(&vec![bits; usize::from(samples)])),
+                (259, 3, 1, shorts(&[if predictor == 1 { 1 } else { 8 }])),
                 (262, 3, 1, shorts(&[2])),
-                (277, 3, 1, shorts(&[4])),
+                (277, 3, 1, shorts(&[samples])),
                 (284, 3, 1, shorts(&[1])),
+                (317, 3, 1, shorts(&[predictor])),
                 (322, 4, 1, longs(&[tile])),
                 (323, 4, 1, longs(&[tile])),
                 (324, 4, offsets.len() as u32, longs(&offsets)),
                 (325, 4, counts.len() as u32, longs(&counts)),
-                (338, 3, 1, shorts(&[0])),
             ];
+            if samples == 4 {
+                e.push((338, 3, 1, shorts(&[0])));
+            }
             if i == 0 {
                 e.push((33550, 12, 3, doubles(&[0.2, 0.2, 0.0])));
                 e.push((33922, 12, 6, doubles(&[0.0, 0.0, 0.0, 641_000.0, 5_650_000.0, 0.0])));
@@ -2066,16 +2321,225 @@ mod tests {
     }
 
     #[test]
+    fn rgbi_header_patches_handle_both_byte_orders_and_tiff_sizes() {
+        for big in [false, true] {
+            for little in [false, true] {
+                let short = |v: u16| if little { v.to_le_bytes() } else { v.to_be_bytes() };
+                let long = |v: u32| if little { v.to_le_bytes() } else { v.to_be_bytes() };
+                let wide = |v: u64| if little { v.to_le_bytes() } else { v.to_be_bytes() };
+                let mut bytes = if little { b"II".to_vec() } else { b"MM".to_vec() };
+                bytes.extend(short(if big { 43 } else { 42 }));
+                let at = if big { 16 } else { 8 };
+                if big {
+                    bytes.extend(short(8));
+                    bytes.extend(short(0));
+                    bytes.extend(wide(at));
+                    bytes.extend(wide(3));
+                } else {
+                    bytes.extend(long(at as u32));
+                    bytes.extend(short(3));
+                }
+                let photo_at = bytes.len() + if big { 12 } else { 8 };
+                for (tag, value) in [(262, 2), (277, 4), (338, 0)] {
+                    bytes.extend(short(tag));
+                    bytes.extend(short(3));
+                    bytes.extend(if big { wide(1).to_vec() } else { long(1).to_vec() });
+                    bytes.extend(short(value));
+                    bytes.extend(vec![0; if big { 6 } else { 2 }]);
+                }
+                bytes.extend(vec![0; if big { 8 } else { 4 }]);
+                let original = bytes.clone();
+                let mut r = Unpaletted::new(std::io::Cursor::new(bytes)).unwrap();
+                assert!(r.first_is_wide_rgb());
+                assert!(!r.first_is_palette());
+                let mut patched = Vec::new();
+                // Reading a byte at a time exercises patches split between reads.
+                let mut byte = [0u8; 1];
+                while r.read(&mut byte).unwrap() != 0 {
+                    patched.push(byte[0]);
+                }
+                let mut want = original.clone();
+                want[photo_at..photo_at + 2].copy_from_slice(&short(1));
+                assert_eq!(patched, want);
+                assert_eq!(r.inner.into_inner(), original);
+            }
+        }
+    }
+
+    #[test]
+    fn rgbi_strips_preserve_samples_and_real_alpha_is_unchanged() {
+        use tiff::encoder::{Compression, DeflateLevel, TiffEncoder, colortype};
+        fn image<K: tiff::encoder::TiffKind>(mut enc: TiffEncoder<std::io::Cursor<&mut Vec<u8>>, K>, extra: u16) {
+            let mut image = enc.new_image::<colortype::RGBA16>(7, 5).unwrap();
+            image.encoder().write_tag(Tag::ExtraSamples, &[extra][..]).unwrap();
+            image.rows_per_strip(2).unwrap();
+            let values: Vec<u16> = (0..7 * 5).flat_map(|p| [1000 + p * 11, 2000 + p * 13, 3000 + p * 17, p % 3]).collect();
+            image.write_data(&values).unwrap();
+        }
+        for big in [false, true] {
+            for extra in [0, 1, 2] {
+                let mut bytes = Vec::new();
+                if big {
+                    image(
+                        TiffEncoder::new_big(std::io::Cursor::new(&mut bytes))
+                            .unwrap()
+                            .with_compression(Compression::Deflate(DeflateLevel::Balanced))
+                            .with_predictor(tiff::encoder::Predictor::Horizontal),
+                        extra,
+                    );
+                } else {
+                    image(
+                        TiffEncoder::new(std::io::Cursor::new(&mut bytes))
+                            .unwrap()
+                            .with_compression(Compression::Deflate(DeflateLevel::Balanced))
+                            .with_predictor(tiff::encoder::Predictor::Horizontal),
+                        extra,
+                    );
+                }
+                let r = read(std::io::Cursor::new(&bytes), "strips").unwrap();
+                assert_eq!(r.color, ColorHint::Rgb { alpha: extra != 0 });
+                assert_eq!(r.band_count(), 4);
+                for p in 0u16..7 * 5 {
+                    for (b, value) in [1000 + p * 11, 2000 + p * 13, 3000 + p * 17, p % 3].iter().enumerate() {
+                        assert_eq!(r.value(b, (p % 7).into(), (p / 7).into()), Some(f32::from(*value)));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cog_overviews_require_matching_sample_counts() {
+        use super::super::cog::{self, Parse, Sparse};
+        for full in [3, 4] {
+            for overview in [3, 4] {
+                let bytes = rgb_tiled_samples(&[(40, 16, full), (20, 16, overview)], 8, 1, |b, x, y| (b * 10 + x + y) as u16);
+                let whole = Sparse::default().with_len(bytes.len() as u64).with(0, bytes);
+                if full == overview {
+                    let Parse::Done(layout) = cog::layout(&whole).unwrap() else { panic!("not a COG") };
+                    assert_eq!(layout.levels.len(), 2);
+                    assert_eq!(layout.bands, usize::from(full));
+                    assert!(layout.lost.iter().all(|n| !n.contains("overview(s)")), "{:?}", layout.lost);
+                } else {
+                    // The overview is left out, and said; the full image is still read.
+                    let Parse::Done(layout) = cog::layout(&whole).unwrap() else { panic!("not a COG") };
+                    assert_eq!((layout.levels.len(), layout.bands), (1, usize::from(full)));
+                    assert!(
+                        layout
+                            .lost
+                            .iter()
+                            .any(|n| n.contains(&format!("1 overview(s) with samples per pixel other than the full image's {full}"))
+                                && n.contains(&format!("image 1 ({overview})"))),
+                        "{:?}",
+                        layout.lost
+                    );
+                }
+            }
+        }
+        // An image no smaller than the level before isn't an overview: skipped, whatever its
+        // samples, rather than failing the file.
+        let bytes = rgb_tiled_samples(&[(40, 16, 4), (20, 16, 4), (20, 16, 3)], 8, 1, |b, x, y| (b * 10 + x + y) as u16);
+        let whole = Sparse::default().with_len(bytes.len() as u64).with(0, bytes);
+        let Parse::Done(layout) = cog::layout(&whole).unwrap() else { panic!("not a COG") };
+        assert_eq!((layout.levels.len(), layout.bands), (2, 4));
+        assert!(layout.lost.iter().all(|n| !n.contains("overview(s)")), "{:?}", layout.lost);
+    }
+
+    /// An RGBI image too large to read whole, with a three-sample overview that would fit: the
+    /// overview would lose the fourth band, so the full image is read sparsely instead.
+    #[test]
+    fn whole_file_reads_skip_overviews_with_other_sample_counts() {
+        let pixel = |b: u32, x: u32, y: u32| (b * 10 + x + y) as u16;
+        let bytes = rgb_tiled_samples(&[(40, 16, 4), (20, 16, 3)], 8, 1, pixel);
+        let r = read_limited(reader(std::io::Cursor::new(&bytes)).unwrap(), "rgbi", 2_000, None).unwrap();
+        assert_eq!((r.band_count(), r.color.clone()), (4, ColorHint::Rgb { alpha: false }));
+        // Every other pixel of the full image, not the full image whole.
+        assert_eq!((r.width, r.height, r.overview), (20, 20, Some((40, 40))));
+        assert_eq!(r.value(3, 0, 0), Some(f32::from(pixel(3, 0, 0))));
+        assert_eq!(r.value(3, 1, 1), Some(f32::from(pixel(3, 2, 2))));
+    }
+
+    #[test]
+    fn rgbi_cog_tiles_keep_the_fourth_band_without_alpha() {
+        use super::super::cog::{self, Parse, Sparse};
+        let pixel = |b: u32, x: u32, y: u32| (1000 + x * 19 + y * 37 + b * 53) as u16;
+        let bytes = rgbi_tiled_encoded(&[(40, 16), (20, 16)], 16, 2, pixel);
+        let whole = Sparse::default().with(0, bytes.clone()).with_len(bytes.len() as u64);
+        let Parse::Done(layout) = cog::layout(&whole).unwrap() else { panic!("not a COG") };
+        // Hold only the IFDs and their values, as a range reader does. This fixture writes each
+        // IFD after its tiles and before the following level's tiles.
+        let mut header = Sparse::default().with(0, bytes[..8].to_vec()).with_len(bytes.len() as u64);
+        let mut ifd = u32::from_le_bytes(bytes[4..8].try_into().unwrap()) as usize;
+        for i in 0..layout.levels.len() {
+            let count = u16::from_le_bytes(bytes[ifd..ifd + 2].try_into().unwrap()) as usize;
+            let next_at = ifd + 2 + count * 12;
+            let end = layout.levels.get(i + 1).map_or(bytes.len(), |l| l.offsets[0] as usize);
+            header = header.with(ifd as u64, bytes[ifd..end].to_vec());
+            ifd = u32::from_le_bytes(bytes[next_at..next_at + 4].try_into().unwrap()) as usize;
+        }
+        let Parse::Done(layout) = cog::layout(&header).unwrap() else { panic!("not a COG header") };
+        assert_eq!(layout.bands, 4);
+        assert_eq!(layout.color, ColorHint::Rgb { alpha: false });
+        for (level, k) in [(0, 1), (1, 2)] {
+            let l = &layout.levels[level];
+            for t in 0..l.tiles() {
+                let at = l.offsets[t as usize] as usize;
+                let count = l.counts[t as usize] as usize;
+                let bands = cog::decode_tile(&header, &layout, level, t, bytes[at..at + count].to_vec()).unwrap();
+                assert_eq!(bands.len(), 4);
+                for y in 0..l.tile_height {
+                    for x in 0..l.tile_width {
+                        let (px, py) = ((t % l.across()) * l.tile_width + x, (t / l.across()) * l.tile_height + y);
+                        for (b, band) in bands.iter().enumerate() {
+                            let v = band[(y * l.tile_width + x) as usize];
+                            if px < l.width && py < l.height {
+                                assert_eq!(v, f32::from(pixel(b as u32, px * k, py * k)));
+                            } else {
+                                assert!(v.is_nan());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn horizontal_predictor_keeps_rgb_and_the_unspecified_fourth_band() {
+        for bits in [8, 16] {
+            let pixel = |b: u32, x: u32, y: u32| ((x * 19 + y * 37 + b * 53) % 251 + 1) as u16 * (if bits == 16 { 200 } else { 1 });
+            let bytes = rgbi_tiled_encoded(&[(40, 16), (20, 16)], bits, 2, pixel);
+            for (max, k) in [(100_000, 1), (2_000, 2)] {
+                let r = read_limited(reader(std::io::Cursor::new(&bytes)).unwrap(), "rgbi", max, None).unwrap();
+                assert_eq!(r.color, ColorHint::Rgb { alpha: false });
+                assert_eq!(r.band_count(), 4);
+                for y in 0..r.height {
+                    for x in 0..r.width {
+                        for b in 0..4 {
+                            assert_eq!(
+                                r.value(b as usize, x.into(), y.into()),
+                                Some(f32::from(pixel(b, x * k, y * k))),
+                                "{bits} bits, band {b}, pixel {x},{y}, scale {k}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn padded_tiles_with_an_extra_sample_stay_in_their_rows() {
         // Issue #162: an RGBI orthophoto (5000 pixels in 128-pixel tiles) opened with black
         // columns down its west edge, the padding of each row's last tile spilt into the next row.
         let pixel = |b: u32, x: u32, y: u32| ((x + 3 * y + 60 * b) % 250 + 1) as u8;
         let bytes = rgbi_tiled(&[(40, 16), (20, 16)], pixel);
+        // Its near-infrared band is read too, the fourth, after red, green and blue.
         let check = |r: &Raster, k: u32| {
-            assert_eq!((r.band_count(), r.color.clone()), (3, ColorHint::Rgb { alpha: false }));
+            assert_eq!((r.band_count(), r.color.clone()), (4, ColorHint::Rgb { alpha: false }));
             for y in 0..r.height {
                 for x in 0..r.width {
-                    for b in 0..3 {
+                    for b in 0..4 {
                         let want = f32::from(pixel(b, x * k, y * k));
                         assert_eq!(r.value(b as usize, i64::from(x), i64::from(y)), Some(want), "band {b} at {x},{y} (k {k})");
                     }

@@ -9,8 +9,9 @@ use rustgis_engine::analysis::{ParamKind, tools};
 use rustgis_engine::data::GeometryType;
 use rustgis_engine::map::raster::{Normalizer, RasterLegend, RasterStyle};
 use rustgis_engine::map::symbology::{
-    ClassRef, ClassStyle, Dash, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, MAX_LABEL, MAX_LINE_MARKER_SIZE, MAX_MARKER_INTERVAL,
-    MAX_STROKE_OFFSET, MAX_STROKE_WIDTH, MAX_STROKES, MAX_UNIQUE, MIN_MARKER_INTERVAL, OTHER_VALUES, Placements, normalize_label,
+    ClassRef, ClassStyle, Dash, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, MAX_EXPRESSION_CLASSES, MAX_LABEL,
+    MAX_LINE_MARKER_SIZE, MAX_MARKER_INTERVAL, MAX_STROKE_OFFSET, MAX_STROKE_WIDTH, MAX_STROKES, MIN_MARKER_INTERVAL, OTHER_VALUES,
+    Placements, normalize_label,
 };
 use rustgis_engine::map::tiles::{TileKind, TileLayer};
 use rustgis_engine::map::{
@@ -1972,16 +1973,26 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
                 let format = src.info().map(|i| i.format).unwrap_or("");
                 let total = src.info().and_then(|i| i.count).map(|c| c.to_string()).unwrap_or_else(|| "?".into());
                 match src.sampled() {
-                    Some((n, matched)) => crate::i18n::fmt(
-                        "{type} · {format}, read in place · a sample of {n} of the {matched} features in view (zoom in to see them all) · {renderer}",
-                        &[
+                    Some((n, matched)) => {
+                        let args = [
                             ("type", tl_raw!(l.geometry_type().label())),
                             ("format", format),
                             ("n", &n.to_string()),
                             ("matched", &matched.to_string()),
                             ("renderer", tl_raw!(l.renderer.kind_label())),
-                        ],
-                    ),
+                        ];
+                        if src.sampled_matches() {
+                            crate::i18n::fmt(
+                                "{type} · {format}, read in place · a sample of {n} of the {matched} features in view matching the definition query (zoom in to see them all) · {renderer}",
+                                &args,
+                            )
+                        } else {
+                            crate::i18n::fmt(
+                                "{type} · {format}, read in place · a sample of {n} of the {matched} features in view (zoom in to see them all) · {renderer}",
+                                &args,
+                            )
+                        }
+                    }
                     None => crate::i18n::fmt(
                         "{type} · {format}, read in place · {n} of {total} features in view · {renderer}",
                         &[
@@ -2775,7 +2786,7 @@ pub fn poll_tool_run(app: &mut RustGisApp, ctx: &egui::Context) {
     };
     let (id, tool) = (job.id, job.tool);
     app.gp.tool_run = None;
-    let r = rustgis_engine::cmd::gp::tool_complete(&mut app.session, id, done).and_then(|_| app.run("gp.finish", json!({"id": id})));
+    let r = rustgis_engine::cmd::gp::tool_complete(&mut app.session, id, done).and_then(|_| app.finish_gp(id));
     finished(app, tool, r);
 }
 
@@ -2826,7 +2837,7 @@ pub fn poll_plugin_run(app: &mut RustGisApp, ctx: &egui::Context) {
     };
     let (id, tool) = (job.id, job.tool);
     app.gp.plugin_run = None;
-    let r = rustgis_engine::cmd::gp::plugin_complete(&mut app.session, id, result).and_then(|_| app.run("gp.finish", json!({"id": id})));
+    let r = rustgis_engine::cmd::gp::plugin_complete(&mut app.session, id, result).and_then(|_| app.finish_gp(id));
     finished(app, tool, r);
 }
 
@@ -2885,7 +2896,7 @@ pub fn poll_geolibre(app: &mut RustGisApp, ctx: &egui::Context) {
     }
     if let Some((id, tool, out)) = app.gp.web_run.as_ref().and_then(|(id, tool, slot)| take(slot).map(|o| (*id, *tool, o))) {
         app.gp.web_run = None;
-        let r = rustgis_engine::cmd::gp::external_complete(&mut app.session, id, out).and_then(|_| app.run("gp.finish", json!({"id": id})));
+        let r = rustgis_engine::cmd::gp::external_complete(&mut app.session, id, out).and_then(|_| app.finish_gp(id));
         finished(app, tool, r);
     }
     if app.gp.web_load.is_some() || app.gp.web_run.is_some() {
@@ -4243,7 +4254,7 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 let e = if text.is_empty() { Value::Null } else { json!(text) };
                 let _ = app.run("layer.symbology", json!({"type": "unique", "expression": e, "ramp": ramp.name()}));
             }
-            ramp_picker(app, ui, ramp, t);
+            ramp_picker_with(app, ui, ramp, t, !l.graphics);
             ui.add_space(6.0);
             ui.label(
                 egui::RichText::new(crate::i18n::fmt("{n} classes", &[("n", &classes.len().to_string())])).size(11.5).color(t.text_dim),
@@ -4280,7 +4291,7 @@ fn symbology(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     }
                 });
             }
-            ramp_picker(app, ui, ramp, t);
+            ramp_picker_with(app, ui, ramp, t, !l.graphics);
             ui.add_space(6.0);
             legend_list(app, ui, &l, t);
         }
@@ -4698,8 +4709,26 @@ fn field_combo(app: &mut RustGisApp, ui: &mut Ui, label: &str, cur: &str, fields
 }
 
 fn ramp_picker(app: &mut RustGisApp, ui: &mut Ui, cur: &Ramp, t: &Tokens) {
+    ramp_picker_with(app, ui, cur, t, false);
+}
+
+/// The color scheme picker; `invert` adds an Invert Color Ramp button to its heading row, for a
+/// layer whose classes take their colors from the scheme (#1355).
+fn ramp_picker_with(app: &mut RustGisApp, ui: &mut Ui, cur: &Ramp, t: &Tokens, invert: bool) {
     ui.add_space(4.0);
-    ui.label(egui::RichText::new(tl!("Color scheme")).size(11.5).color(t.text_dim));
+    let heading = egui::RichText::new(tl!("Color scheme")).size(11.5).color(t.text_dim);
+    if invert {
+        ui.horizontal(|ui| {
+            ui.label(heading);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.small_button(tl!("Invert Color Ramp")).on_hover_text(tl!("Reverse the order of the classes' colors.")).clicked() {
+                    let _ = app.run("layer.invertRamp", json!({}));
+                }
+            });
+        });
+    } else {
+        ui.label(heading);
+    }
     let grid = |app: &mut RustGisApp, ui: &mut Ui, id: &str, ramps: Vec<Ramp>| {
         // Two to a row, in the width left inside the group's indent.
         let w = (ui.available_width() - 8.0) / 2.0;
@@ -4875,13 +4904,17 @@ fn legend_list(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
             // Unique Values legends sort their classes (by value or by label): row i shows class `order[i]`,
             // and the rows past them (`<all other values>`) keep their place.
             let order = l.renderer.class_order();
-            // At most MAX_UNIQUE classes (a style import can bring more), then Unique Values'
-            // `<all other values>`, the legend's last row, whatever their number.
-            let rows: Vec<usize> = match &l.renderer {
+            // As many classes as can be drawn from an expression or a QGIS rule style
+            // (MAX_EXPRESSION_CLASSES), then Unique Values' `<all other values>`, the legend's
+            // last row, whatever their number. A categorized style import can bring more: how
+            // many aren't listed is said below the list.
+            let (rows, unlisted): (Vec<usize>, usize) = match &l.renderer {
                 Renderer::Unique { .. } => {
-                    (0..legend.len().saturating_sub(1)).take(MAX_UNIQUE).chain(legend.len().checked_sub(1)).collect()
+                    let classes = legend.len().saturating_sub(1);
+                    let rows = (0..classes).take(MAX_EXPRESSION_CLASSES).chain(legend.len().checked_sub(1)).collect();
+                    (rows, classes.saturating_sub(MAX_EXPRESSION_CLASSES))
                 }
-                _ => (0..legend.len()).take(MAX_UNIQUE + 1).collect(),
+                _ => ((0..legend.len()).take(MAX_EXPRESSION_CLASSES).collect(), legend.len().saturating_sub(MAX_EXPRESSION_CLASSES)),
             };
             let mut seen = std::collections::HashSet::new();
             for i in rows {
@@ -5001,6 +5034,17 @@ fn legend_list(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                         ui.data_mut(|d| d.insert_temp(typing, buf));
                     }
                 });
+            }
+            if unlisted > 0 {
+                let note = if unlisted == 1 {
+                    tl!("1 more class isn't listed: the list's limit doesn't change how it's drawn").to_string()
+                } else {
+                    crate::i18n::fmt(
+                        "{n} more classes aren't listed: the list's limit doesn't change how they're drawn",
+                        &[("n", &unlisted.to_string())],
+                    )
+                };
+                ui.label(egui::RichText::new(note).size(11.5).color(t.text_dim));
             }
         },
     );
@@ -6256,20 +6300,36 @@ fn raster_legend_rows(ui: &mut Ui, entries: &[RasterLegend], indent: f32, t: &To
 
 fn raster_details(ui: &mut Ui, rl: &rustgis_engine::map::RasterLayer, t: &Tokens) {
     let Some(d) = &rl.data else {
-        ui.label(egui::RichText::new(tl!("The raster's data couldn't be read.")).color(t.red));
+        // Read in place, its overview is on its way until it lands, or fails (said why).
+        match &rl.error {
+            None if rl.in_place => {
+                ui.label(egui::RichText::new(tl!("Reading in place…")).color(t.text_dim));
+            }
+            error => {
+                ui.label(egui::RichText::new(tl!("The raster's data couldn't be read.")).color(t.red));
+                if let Some(e) = error {
+                    ui.label(egui::RichText::new(e).size(11.0));
+                }
+            }
+        }
         if let Some(p) = &rl.path {
             ui.label(egui::RichText::new(p).monospace().size(11.0));
         }
         return;
     };
     let e = d.extent();
-    let (cx, cy) = d.cell_size();
     let unit = if d.crs.is_geographic() { "°" } else { " m" };
+    // Read in place, the map draws the full image: its size and cell size, not the overview's.
+    let full = d.overview.filter(|_| rl.in_place);
+    let (w, h) = full.unwrap_or((d.width, d.height));
+    let (cx, cy) = d.cell_size();
+    let (cx, cy) = (cx * f64::from(d.width) / f64::from(w.max(1)), cy * f64::from(d.height) / f64::from(h.max(1)));
+    let f = rustgis_engine::map::symbology::fmt_num;
     let mut rows = vec![
-        ("Size", format!("{} × {}", d.width, d.height)),
+        ("Size", format!("{w} × {h}")),
         ("Bands", d.band_count().to_string()),
         ("Pixel type", d.data_type.clone()),
-        ("Cell size", format!("{} × {}{unit}", rustgis_engine::map::symbology::fmt_num(cx), rustgis_engine::map::symbology::fmt_num(cy))),
+        ("Cell size", format!("{} × {}{unit}", f(cx), f(cy))),
         ("Coordinate system", d.crs.label()),
         ("NoData", d.nodata.map(|v| v.to_string()).unwrap_or_else(|| "—".into())),
         ("Symbology", tl!(rl.style.renderer.label()).to_string()),
@@ -6280,8 +6340,23 @@ fn raster_details(ui: &mut Ui, rl: &rustgis_engine::map::RasterLayer, t: &Tokens
         ("South", format!("{:.4}°", e.min_y)),
         ("North", format!("{:.4}°", e.max_y)),
     ];
-    if let Some((w, h)) = d.overview {
-        rows.insert(1, ("Full size", format!("{w} × {h}")));
+    match d.overview {
+        // Read in place: the overview is what the layer holds.
+        Some(_) if rl.in_place => {
+            rows.insert(
+                1,
+                (
+                    "Read",
+                    crate::i18n::fmt(
+                        "In place, holding a {w} × {h} overview",
+                        &[("w", &d.width.to_string()), ("h", &d.height.to_string())],
+                    ),
+                ),
+            );
+        }
+        Some((fw, fh)) => rows.insert(1, ("Full size", format!("{fw} × {fh}"))),
+        None if rl.in_place => rows.insert(1, ("Read", tl!("In place").to_string())),
+        None => {}
     }
     let value_w = (ui.available_width() - 140.0).max(80.0);
     egui::Grid::new("raster_details").num_columns(2).striped(true).max_col_width(value_w).spacing(vec2(12.0, 4.0)).show(ui, |ui| {
@@ -7142,6 +7217,7 @@ mod tests {
     /// from its menu, and is dragged to another place.
     #[test]
     fn a_tile_layer_is_listed_and_moved_among_the_layers() {
+        let _turn = crate::fetching::turn();
         use egui_kittest::kittest::Queryable;
         let mut app = RustGisApp::with_sample();
         for c in ["Cities", "Countries"] {
@@ -7266,6 +7342,7 @@ mod tests {
     /// mode identifies it), and clicking a layer's row picks that instead.
     #[test]
     fn a_tile_layers_row_is_picked_with_a_click() {
+        let _turn = crate::fetching::turn();
         use egui_kittest::kittest::Queryable;
         let mut app = RustGisApp::with_sample();
         app.run("map.addTiles", json!({"url": "https://wms.example.org/{z}/{x}/{y}.png", "name": "Depths", "overlay": true})).unwrap();
@@ -7918,6 +7995,60 @@ mod tests {
         let mut raised = egui::ecolor::Hsva::from_srgb([200, 30, 40]);
         raised.a = 1.0;
         assert_eq!(picked_colour(raised, 0.0, picked), picked.with_alpha(255), "raising the opacity shows it");
+    }
+
+    /// The Unique Values list shows as many classes as can be drawn from a QGIS rule style
+    /// (MAX_EXPRESSION_CLASSES), not only as many as a field's automatic classes (#1252); past
+    /// that, as a categorized style import can bring, it says how many it doesn't list.
+    #[test]
+    fn unique_values_list_every_class_drawn_and_says_how_many_it_leaves_out() {
+        use egui::accesskit::Role;
+        use egui_kittest::kittest::Queryable;
+        let mut app = RustGisApp::with_sample();
+        app.run("layer.symbology", json!({"layer": "Countries", "type": "unique", "field": "name"})).unwrap();
+        let id = layer(&app, "Countries");
+        // A style import's classes past the automatic ones: `n` in all.
+        let grow_to = |app: &mut RustGisApp, n: usize| {
+            if let Some(l) = app.session.map_mut().layers.iter_mut().find(|l| l.id == id)
+                && let Renderer::Unique { classes, .. } = &mut l.renderer
+            {
+                let symbol = classes[0].1;
+                let had = classes.len();
+                classes.extend((had..n.max(had)).map(|i| (format!("imported {i}"), symbol)));
+            }
+        };
+        let n = 150;
+        assert!(n > rustgis_engine::map::symbology::MAX_UNIQUE && n <= MAX_EXPRESSION_CLASSES);
+        grow_to(&mut app, n);
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(600.0, 600.0)).with_max_steps(8).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                let layer = app.session.map().layer(id).unwrap().clone();
+                egui::ScrollArea::vertical().show(ui, |ui| legend_list(app, ui, &layer, &Tokens::light()));
+            },
+            app,
+        );
+        h.run_steps(2);
+        // A label box for each class, and one for `<all other values>`.
+        assert_eq!(h.query_all_by_role(Role::TextInput).count(), n + 1);
+        assert!(h.query_by_label_contains("more classes aren't listed").is_none());
+
+        // More than can be listed, as a categorized style import can bring: the first ones,
+        // `<all other values>`, and how many are left out.
+        grow_to(h.state_mut(), MAX_EXPRESSION_CLASSES + 37);
+        h.run_steps(2);
+        assert_eq!(h.query_all_by_role(Role::TextInput).count(), MAX_EXPRESSION_CLASSES + 1);
+        // `<all other values>` keeps the last row.
+        let last = h.query_all_by_role(Role::TextInput).last().and_then(|n| n.value()).unwrap_or_default();
+        assert_eq!(last, OTHER_VALUES);
+        assert!(h.query_by_label_contains("37 more classes aren't listed").is_some());
+        // One left out is said as one.
+        if let Some(l) = h.state_mut().session.map_mut().layers.iter_mut().find(|l| l.id == id)
+            && let Renderer::Unique { classes, .. } = &mut l.renderer
+        {
+            classes.truncate(MAX_EXPRESSION_CLASSES + 1);
+        }
+        h.run_steps(2);
+        assert!(h.query_by_label_contains("1 more class isn't listed").is_some());
     }
 
     /// Editing opacity must not turn a transparent red or a near-transparent colour into black.

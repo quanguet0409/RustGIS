@@ -306,7 +306,8 @@ pub struct MapView {
     pub menu_lonlat: Option<Coord>,
     /// The text graphic the context menu was opened on (layer id, row), for Edit Text.
     pub menu_text: Option<(u32, usize)>,
-    pub dms: bool,
+    /// How the pointer's coordinates read (status bar, right-click menu); a preference.
+    pub coord_format: crate::CoordReadout,
     pub render_ms: u64,
     pub notices_seen: usize,
     pub toasts: Vec<Toast>,
@@ -404,7 +405,7 @@ impl Default for MapView {
             pointer_lonlat: None,
             menu_lonlat: None,
             menu_text: None,
-            dms: false,
+            coord_format: crate::CoordReadout::Decimal,
             render_ms: 0,
             notices_seen: 0,
             toasts: Vec::new(),
@@ -794,13 +795,21 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     WAKER.call_once(|| {
         let ctx = ui.ctx().clone();
         rustgis_engine::render::rustgis_tiles::cache::set_waker(move || ctx.request_repaint());
+        // A read that failed is tried again when its wait is over, though nothing else moves.
+        let ctx = ui.ctx().clone();
+        rustgis_engine::render::rustgis_tiles::cache::set_alarm(move |after| ctx.request_repaint_after(after));
         let ctx = ui.ctx().clone();
         rustgis_engine::map::source::set_waker(move || ctx.request_repaint());
     });
     let mut key = key;
     // A scene whose tile layers are all live places them for every frame: tiles arriving need no
     // new scene (#635).
-    if gpu_ok && cam.bearing == 0.0 && cam.pitch == 0.0 && app.map.live_rev == Some(app.session.revision) {
+    if gpu_ok
+        && cam.bearing == 0.0
+        && cam.pitch == 0.0
+        && app.map.live_rev == Some(app.session.revision)
+        && !reads_in_place(app.session.map())
+    {
         key.tiles = 0;
     } else if fetches_tiles(app.session.map()) {
         key.tiles = rustgis_engine::render::rustgis_tiles::cache::generation();
@@ -1278,6 +1287,13 @@ fn drape_state(app: &RustGisApp) -> (crate::globe_drape::DrapeKey, u64) {
 fn fetches_tiles(m: &rustgis_engine::map::Map) -> bool {
     !m.tiles.is_empty()
         || m.view.terrain.as_ref().is_some_and(|t| matches!(t.source, rustgis_engine::map::view::TerrainSource::Tiles { .. }))
+        || reads_in_place(m)
+}
+
+/// Whether the map has raster layers read in place: the part in view arrives a tile at a time,
+/// through the tile cache, and the map is drawn again as it does.
+fn reads_in_place(m: &rustgis_engine::map::Map) -> bool {
+    m.layers.iter().any(|l| l.raster.as_ref().is_some_and(|r| r.in_place))
 }
 
 /// Uploads a composed GPU scene, whether built in place or by the frame worker.
@@ -4846,6 +4862,7 @@ mod tests {
     /// included, so every step of a slider drag made the map flicker.
     #[test]
     fn a_style_change_over_tiles_keeps_the_frame_instead_of_a_preview() {
+        let _turn = crate::fetching::turn();
         let mut app = RustGisApp::with_sample();
         // Nothing listens there: the tiles fail, the map still draws.
         app.run("map.addTiles", json!({"url": "http://127.0.0.1:9/{z}/{x}/{y}.png", "name": "Offline"})).expect("tile layer");

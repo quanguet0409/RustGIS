@@ -153,10 +153,14 @@ With Unique Values or Graduated Colors, each class in the Symbology pane's list 
 and a legend label. Pick a colour and opacity to give that class its own. Type a label to show in the Layers
 pane and in layout legends instead of the value or range (for example `High income` for
 `1. High income: OECD`); clear it to show the value again. `<all other values>` can be edited the
-same way. Applying the symbology again on the same field keeps the colours, outlines and labels
-you set by hand on the classes that are still there (the others take the scheme's colours again);
-picking another colour scheme recolours every class but keeps the labels. A Graduated Colors
-class keeps its colour and label while its range stays the same. By command:
+same way. The list shows up to 200 classes. A style imported with more says below the list how many
+it leaves out: the list's limit doesn't change how they're drawn, and `layer.classStyle` edits them,
+a Unique Values class by its `value` (a value listed twice is drawn, and edited, as its first class)
+and a Graduated Colors class by its `index`. Applying the symbology again on the same field keeps
+the colours, outlines and labels you set by hand on the classes that are still there (the others
+take the scheme's colours again); picking another colour scheme recolours every class but keeps the
+labels. A Graduated Colors class keeps its colour and label while its range stays the same. By
+command:
 
 ```text
 layer.classStyle={"layer":"Countries","value":"1. High income: OECD","color":"#2E6B4F","label":"High income"}
@@ -181,6 +185,34 @@ same field, ranges and scheme also preserves opacity, including edits that chang
 As with other class colour edits, changing the field or graduated ranges starts fresh; choosing
 a different scheme through `layer.symbology` resets polygon opacity to its default.
 Layer/group transparency still applies on top of the symbol's opacity in maps and exports.
+
+**Invert Color Ramp** (Symbology pane, or `layer.invertRamp`) reverses the colours of a Graduated
+Colors or Unique Values layer's classes along the legend's order, so the highest class takes the
+lowest class's colour. Colours edited by hand travel with the reversal, but a polygon fill's
+opacity stays with its position in the legend, as it does when a colour scheme is applied: a
+semi-transparent fill picked for the first class is still the first class's opacity afterwards.
+Applying it twice gives the original back. The `<all other values>` swatch is no colour of the
+scheme and stays as it is. With fewer than two classes showing the scheme there is nothing to
+reverse, and the command says so instead of succeeding.
+
+A class whose own stack hides its symbol keeps it, and the others reverse among themselves; a
+notice says how many classes with a stack of their own were left as they are. A stack hides the
+symbol when it is drawn (stacked fills on a polygon layer, stacked strokes on a line or point
+layer; a polygon's stacked strokes and a line's stacked fills are not drawn) and every layer of it
+sets a colour of its own. A layer of a stack left on "follow the class" shows the class's colour,
+so that class reverses with the rest: a road's black casing over a core that follows the class.
+When the layer's own stack (the one classes without a stack of their own are drawn from) sets a
+colour in every layer, the classes show those colours and little of the colour scheme: the colours
+are reversed all the same, and a notice says so. On a layer that holds several kinds of geometry,
+the reversal treats every class as the layer's main kind, as choosing a colour scheme does.
+A fill or stroke colour from **Symbol by Expression** is drawn over the classes' colours wherever
+the expression gives one, so the reversal shows only where it gives none, and a notice says so.
+
+Choosing a colour scheme again starts from the scheme's own order, but classing the layer again
+on the same field, ranges and scheme keeps the reversed colours, as it keeps other colours edited
+by hand. On a Stretch raster the command switches the existing "Invert color scheme" option. A
+graphics layer draws each feature in its own style, so it has no colour scheme to invert and the
+command says so.
 
 ### Line strokes
 

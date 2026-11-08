@@ -1,6 +1,7 @@
 use serde_json::json;
 
 use super::*;
+use crate::{Coord, Geometry, GeometryType};
 
 /// A document in longitude/latitude (unit transform), with the given vertices and objects.
 fn doc(vertices: Json, objects: Json) -> Vec<u8> {
@@ -1087,4 +1088,236 @@ fn layers_of_types_cut_to_one_name_are_told_apart() {
     );
     assert!(out.iter().all(|(d, _)| d.features.len() == 1));
     assert_eq!(unique_names(vec!["x".into(), "y".into()]), ["x", "y"], "names that differ are kept");
+}
+
+/// A level of detail whose points a transform takes past a number doesn't take the place of a
+/// lower one that draws, for points and lines alike.
+#[test]
+fn a_level_its_transform_overflows_leaves_a_drawn_one_in_place() {
+    let scale = json!({"transform": {"scale": [1e308, 1.0, 1.0], "translate": [0.0, 0.0, 0.0]}});
+    let objects = json!({"a": {"type": "Road", "geometry": [
+        {"type": "MultiPoint", "lod": "1", "boundaries": [0]},
+        {"type": "MultiPoint", "lod": "2", "boundaries": [1]},
+        {"type": "MultiLineString", "lod": "1", "boundaries": [[0, 2]]},
+        {"type": "MultiLineString", "lod": "2", "boundaries": [[1, 2]]},
+    ]}});
+    let out = read("m.city.json", &doc_with(json!([[0, 0, 0], [10, 0, 0], [0, 1, 0]]), objects.clone(), scale), None).unwrap();
+    let points = out.iter().map(|(ds, _)| ds).find(|ds| ds.name.ends_with("points")).unwrap();
+    assert_eq!(geometry(points, 0), Some(&Geometry::Point(Coord::new(0.0, 0.0))));
+    assert_eq!(value(points, 0, "lod"), crate::Value::Text("1".into()));
+    let lines = out.iter().map(|(ds, _)| ds).find(|ds| ds.name.ends_with("lines")).unwrap();
+    assert_eq!(geometry(lines, 0), Some(&Geometry::Line(vec![vec![Coord::new(0.0, 0.0), Coord::new(0.0, 1.0)]])));
+    assert_eq!(value(lines, 0, "lod"), crate::Value::Text("1".into()));
+    assert!(says(&out, "1 city objects have a geometry whose X or Y can't be drawn"), "{:?}", messages_of(&out));
+    let clean = json!({"transform": {"scale": [1.0, 1.0, 1.0], "translate": [0.0, 0.0, 0.0]}});
+    let out = read("m.city.json", &doc_with(json!([[0, 0, 0], [10, 0, 0], [0, 1, 0]]), objects, clean), None).unwrap();
+    assert!(!says(&out, "X or Y can't be drawn"), "{:?}", messages_of(&out));
+}
+
+/// A single face is held to the coordinates a footprint takes: past them it has none, and that is
+/// said, rather than stretching the layer's extent.
+#[test]
+fn a_lone_face_past_the_coordinate_limit_has_no_footprint() {
+    let vertices = json!([[0, 0, 0], [1e200, 0, 0], [1e200, 1e200, 0], [0, 1e200, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0]]);
+    let far = json!({"type": "MultiSurface", "lod": "0", "boundaries": [[[0, 1, 2, 3]]]});
+    let near = json!({"type": "MultiSurface", "lod": "2", "boundaries": [[[0, 4, 5, 6]]]});
+    let objects = json!({"far": {"type": "Building", "geometry": [far]}, "near": {"type": "Building", "geometry": [far, near]}});
+    let out = read("m.city.json", &doc(vertices, objects), Crs::from_epsg(3857)).unwrap();
+    assert!(geometry(&out[0].0, 0).is_none(), "{:?}", geometry(&out[0].0, 0));
+    assert!(says(&out, "1 city objects have a shape that can't be drawn"), "{:?}", messages_of(&out));
+    // With a higher level to draw from, that one is drawn, and the level passed over is said.
+    assert!(geometry(&out[0].0, 1).is_some(), "near");
+    assert_eq!(value(&out[0].0, 1, "lod"), crate::Value::Text("2".into()));
+    assert!(says(&out, "1 city objects have a geometry whose X or Y can't be drawn"), "{:?}", messages_of(&out));
+    // A lone ground face is held to the same limit, and so are points.
+    let vertices = json!([[0, 0, 0], [2e150, 0, 0], [2e150, 2e150, 0], [0, 2e150, 0]]);
+    let objects = json!({
+        "ground": {"type": "Building", "geometry": [{"type": "MultiSurface", "lod": "2", "boundaries": [[[0, 1, 2, 3]]],
+            "semantics": {"surfaces": [{"type": "GroundSurface"}], "values": [0]}}]},
+        "point": {"type": "Tree", "geometry": [{"type": "MultiPoint", "lod": "1", "boundaries": [2]}]},
+    });
+    let out = read("m.city.json", &doc(vertices, objects), Crs::from_epsg(3857)).unwrap();
+    assert!(out.iter().all(|(ds, _)| geometry(ds, 0).is_none()), "{:?}", messages_of(&out));
+    assert!(says(&out, "2 city objects have a shape that can't be drawn"), "{:?}", messages_of(&out));
+    // A wall past the limit fails LoD 0 whole, and its ground alone is drawn.
+    let vertices = json!([[0, 0, 0], [10, 0, 0], [10, 10, 0], [0, 10, 0], [0, 0, 5], [1e200, 0, 5]]);
+    let lod0 = json!({"type": "MultiSurface", "lod": "0", "boundaries": [[[0, 1, 2, 3]], [[0, 1, 5, 4]]],
+        "semantics": {"surfaces": [{"type": "GroundSurface"}, {"type": "WallSurface"}], "values": [0, 1]}});
+    let out = read("m.city.json", &doc(vertices, json!({"a": {"type": "Building", "geometry": [lod0]}})), Crs::from_epsg(3857)).unwrap();
+    assert!(geometry(&out[0].0, 0).is_some(), "{:?}", messages_of(&out));
+    assert_eq!(value(&out[0].0, 0, "lod"), crate::Value::Text("0".into()));
+    assert!(says(&out, "1 city objects have a geometry whose X or Y can't be drawn"), "{:?}", messages_of(&out));
+}
+
+/// A level 0 face that outlines no area gives way to the ground, and the ground to the union.
+#[test]
+fn a_footprint_that_fails_gives_way_to_the_next_source() {
+    let vertices = json!([
+        [0, 0, 0],
+        [5, 0, 0],
+        [10, 0, 0],
+        [0, 0, 0],
+        [10, 0, 0],
+        [10, 10, 0],
+        [0, 10, 0],
+        [0, 0, 5],
+        [20, 0, 5],
+        [20, 20, 5],
+        [0, 20, 5]
+    ]);
+    let line = json!({"type": "MultiSurface", "lod": "0", "boundaries": [[[0, 1, 2]]]});
+    let ground = json!({"type": "MultiSurface", "lod": "2", "boundaries": [[[3, 4, 5, 6]], [[7, 8, 9, 10]]],
+        "semantics": {"surfaces": [{"type": "GroundSurface"}, {"type": "RoofSurface"}], "values": [0, 1]}});
+    let edge_on_ground = json!({"type": "MultiSurface", "lod": "2", "boundaries": [[[0, 2, 8]], [[7, 8, 9, 10]]],
+        "semantics": {"surfaces": [{"type": "GroundSurface"}, {"type": "RoofSurface"}], "values": [0, 1]}});
+    let bytes = doc(
+        vertices,
+        json!({"a": {"type": "Building", "geometry": [line.clone(), ground]}, "b": {"type": "Building", "geometry": [line, edge_on_ground]}}),
+    );
+    let out = read("m.city.json", &bytes, None).unwrap();
+    let ds = &out[0].0;
+    assert!((area(geometry(ds, 0)) - 100.0).abs() < 1e-6, "the ground: {:?}", geometry(ds, 0));
+    assert_eq!(value(ds, 0, "lod"), crate::Value::Text("2".into()));
+    assert!((area(geometry(ds, 1)) - 400.0).abs() < 1e-6, "the roof's union: {:?}", geometry(ds, 1));
+    assert!(!says(&out, "can't be drawn"), "{:?}", messages_of(&out));
+}
+
+/// Attribute names are decided for the whole layer, so each column holds one source attribute: one
+/// named as a field, or as another but for case, takes the same new name in every row.
+#[test]
+fn attribute_names_hold_for_the_whole_layer() {
+    let solid = json!([{"type": "Solid", "lod": "2", "boundaries": box_shell()}]);
+    let bytes = doc(
+        box_vertices(),
+        json!({
+            "a": {"type": "Building", "attributes": {"height": 99, "Name": "x"}, "geometry": solid},
+            "b": {"type": "Building", "attributes": {"height": 5, "height_1": 7, "name": "y"}, "geometry": solid},
+        }),
+    );
+    let out = read("m.city.json", &bytes, None).unwrap();
+    let ds = &out[0].0;
+    let names: Vec<&str> = ds.fields.iter().map(|f| f.name.as_str()).collect();
+    assert!(names.contains(&"Name") && names.contains(&"name_1") && !names.contains(&"name"), "{names:?}");
+    assert_eq!(value(ds, 0, "height_2"), crate::Value::Int(99));
+    assert_eq!(value(ds, 1, "height_2"), crate::Value::Int(5));
+    assert_eq!(value(ds, 0, "height_1"), crate::Value::Null);
+    assert_eq!(value(ds, 1, "height_1"), crate::Value::Int(7));
+    assert_eq!(value(ds, 0, "Name"), crate::Value::Text("x".into()));
+    assert_eq!(value(ds, 1, "name_1"), crate::Value::Text("y".into()));
+    assert!(says(&out, "the same name in another case: name"), "{:?}", messages_of(&out));
+    // Names that differ, in case too, are kept as they come, with no notice.
+    let bytes = doc(box_vertices(), json!({"a": {"type": "Building", "attributes": {"name": "x", "kind": 1}, "geometry": solid}}));
+    let out = read("m.city.json", &bytes, None).unwrap();
+    assert!(!says(&out, "renamed"), "{:?}", messages_of(&out));
+    assert_eq!(value(&out[0].0, 0, "name"), crate::Value::Text("x".into()));
+}
+
+/// A layer of lines that are one point each has geometry but draws nothing: it goes after one that
+/// draws, so a `.json` file, which adds only the first, opens what can be seen.
+#[test]
+fn a_layer_that_draws_nothing_goes_after_one_that_draws() {
+    let objects = json!({
+        "a": {"type": "A", "geometry": [{"type": "MultiLineString", "lod": "1", "boundaries": [[0]]}]},
+        "b": {"type": "B", "geometry": [{"type": "MultiSurface", "lod": "1", "boundaries": [[[0, 1, 2, 3]]]}]},
+    });
+    let out = read("m.city.json", &doc(box_vertices(), objects), None).unwrap();
+    assert_eq!(out.iter().map(|(d, _)| d.name.as_str()).collect::<Vec<_>>(), ["m B", "m A"]);
+}
+
+/// A line that would draw but for its X or Y, left out for one that draws nothing, is said: the
+/// object keeps a row with geometry, so the notice for a shape that can't be drawn doesn't count it.
+#[test]
+fn a_line_lost_to_its_coordinates_is_said_when_what_is_kept_draws_nothing() {
+    let vertices = json!([[0, 0, 0], [1e200, 0, 0], [0, 1, 0]]);
+    let lines = |far: usize| {
+        json!({"a": {"type": "Road", "geometry": [
+            {"type": "MultiLineString", "lod": "1", "boundaries": [[0, far]]},
+            {"type": "MultiLineString", "lod": "2", "boundaries": [[0]]},
+        ]}})
+    };
+    let out = read("m.city.json", &doc(vertices.clone(), lines(1)), Crs::from_epsg(3857)).unwrap();
+    assert_eq!(value(&out[0].0, 0, "lod"), crate::Value::Text("2".into()));
+    assert!(says(&out, "1 city objects have a line whose X or Y can't be drawn"), "{:?}", messages_of(&out));
+    assert!(!says(&out, "shape that can't be drawn"), "{:?}", messages_of(&out));
+    // With the LoD 1 line's X and Y good, it is drawn, and nothing is said.
+    let out = read("m.city.json", &doc(vertices.clone(), lines(2)), Crs::from_epsg(3857)).unwrap();
+    assert_eq!(value(&out[0].0, 0, "lod"), crate::Value::Text("1".into()));
+    assert!(!says(&out, "X or Y can't be drawn"), "{:?}", messages_of(&out));
+    // Above a line of one point, the line left out is a higher level: the one kept is the one that
+    // can be drawn from, not the one that can't.
+    let objects = json!({"a": {"type": "Road", "geometry": [
+        {"type": "MultiLineString", "lod": "1", "boundaries": [[0]]},
+        {"type": "MultiLineString", "lod": "2", "boundaries": [[0, 1]]},
+    ]}});
+    let out = read("m.city.json", &doc(vertices, objects), Crs::from_epsg(3857)).unwrap();
+    assert_eq!(value(&out[0].0, 0, "lod"), crate::Value::Text("1".into()));
+    assert!(geometry(&out[0].0, 0).is_some());
+    assert!(says(&out, "1 city objects have a line whose X or Y can't be drawn"), "{:?}", messages_of(&out));
+    assert!(!says(&out, "shape that can't be drawn"), "{:?}", messages_of(&out));
+}
+
+/// Attributes are typed as the GeoJSON reader types properties: a field takes the type of every
+/// value in its layer, nulls aside, widening integers to decimals and mixed kinds to text.
+#[test]
+fn attributes_are_typed_by_every_value_in_their_layer() {
+    let solid = json!([{"type": "Solid", "lod": "2", "boundaries": box_shell()}]);
+    // The same box on the vertices after the first eight.
+    let higher = json!([{"type": "Solid", "lod": "2", "boundaries": [[[[8, 11, 10, 9]], [[12, 13, 14, 15]], [[8, 9, 13, 12]]]]}]);
+    let objects = json!({
+        "a": {"type": "Building", "attributes": {"count": null, "share": 1, "mixed": 1, "flag": true, "nested": {"k": 1, "a": [2]},
+            "big": 18446744073709551615_u64, "none": null, "exact": 1e300}, "geometry": solid},
+        "b": {"type": "Building", "attributes": {"count": 3, "share": 0.5, "mixed": "x", "flag": false, "big": 1, "exact": 0.1}, "geometry": higher},
+    });
+    // From 2 to 9 high and from 20 to 30: each height its own value, in each row, so none can stand
+    // in another's place.
+    let vertices = Json::Array([square(2), square(9), square(20), square(30)].concat());
+    let out = read("m.city.json", &doc(vertices, objects), None).unwrap();
+    let ds = &out[0].0;
+    let heights = |row| [value(ds, row, "z_min"), value(ds, row, "z_max"), value(ds, row, "height")];
+    assert_eq!(heights(0), [2.0, 9.0, 7.0].map(crate::Value::Float));
+    assert_eq!(heights(1), [20.0, 30.0, 10.0].map(crate::Value::Float));
+    let ty = |name: &str| ds.fields.iter().find(|f| f.name == name).map(|f| f.ty);
+    assert_eq!(ty("count"), Some(crate::FieldType::Integer));
+    assert_eq!(ty("share"), Some(crate::FieldType::Double));
+    assert_eq!(ty("mixed"), Some(crate::FieldType::Text));
+    assert_eq!(ty("flag"), Some(crate::FieldType::Boolean));
+    assert_eq!(ty("nested"), Some(crate::FieldType::Text));
+    assert_eq!(value(ds, 0, "share"), crate::Value::Float(1.0));
+    assert_eq!(value(ds, 0, "mixed"), crate::Value::Text("1".into()));
+    assert_eq!(value(ds, 0, "count"), crate::Value::Null);
+    assert_eq!(value(ds, 1, "nested"), crate::Value::Null);
+    assert_eq!(value(ds, 0, "nested"), crate::Value::Text(r#"{"a":[2],"k":1}"#.into()));
+    // Past a 64-bit integer, a number is a decimal, and so is its column.
+    assert_eq!(ty("big"), Some(crate::FieldType::Double));
+    assert_eq!(value(ds, 0, "big"), crate::Value::Float(18446744073709551615_u64 as f64));
+    assert_eq!(ty("none"), Some(crate::FieldType::Text));
+    assert_eq!(value(ds, 0, "exact"), crate::Value::Float(1e300));
+    assert_eq!(value(ds, 1, "exact"), crate::Value::Float(0.1));
+    let names: Vec<&str> = ds.fields.iter().map(|f| f.name.as_str()).collect();
+    assert_eq!(
+        names,
+        ["id", "type", "parent", "lod", "big", "count", "exact", "flag", "mixed", "nested", "none", "share", "z_min", "z_max", "height"]
+    );
+}
+
+/// A line whose first point's X is NaN still has two different points to draw from: left out for
+/// its coordinates, beside a line of one point kept, it is said. (A CityGML reader can meet NaN,
+/// whose numbers are text; CityJSON's can't be.)
+#[test]
+fn a_line_starting_at_nan_is_said_when_lost() {
+    let mut parts = ObjectParts::default();
+    parts.lines.add_lines(1.0, || Some("1".into()), vec![vec![[f64::NAN, 0.0, 0.0], [1.0, 0.0, 0.0], [2.0, 0.0, 0.0]]]);
+    parts.lines.add_lines(2.0, || Some("2".into()), vec![vec![[0.0, 0.0, 0.0]]]);
+    let (mut counts, mut budget) = (Counts::default(), MAX_FILE_FACES);
+    let made = object_rows(parts, 0, &mut counts, &mut budget);
+    assert_eq!(made.rows.first().and_then(|r| r.lod.as_deref()), Some("2"));
+    assert_eq!((counts.unusable_lost, counts.no_footprint), (1, 0));
+    // With NaN and one point that is a number, it has no two points to draw from: nothing is lost.
+    let mut parts = ObjectParts::default();
+    parts.lines.add_lines(1.0, || Some("1".into()), vec![vec![[f64::NAN, 0.0, 0.0], [1.0, 0.0, 0.0], [f64::NAN, 5.0, 0.0]]]);
+    parts.lines.add_lines(2.0, || Some("2".into()), vec![vec![[0.0, 0.0, 0.0]]]);
+    let mut counts = Counts::default();
+    let made = object_rows(parts, 0, &mut counts, &mut budget);
+    assert_eq!(made.rows.first().and_then(|r| r.lod.as_deref()), Some("2"));
+    assert_eq!(counts.unusable_lost, 0);
 }

@@ -22,8 +22,14 @@ pub const UPLOAD: &str = "upload:";
 const MAX_UPLOADS: usize = 16;
 /// A file that couldn't be read is tried again after this long.
 const RETRY: Duration = Duration::from_secs(60);
-/// Invalidates completions that started before a metadata clear.
+/// Counts clears and per-file forgets, so a completion can tell whether one happened since it started.
 static EPOCH: AtomicU64 = AtomicU64::new(0);
+/// The epoch of the last clear of every file's metadata.
+static CLEARED: AtomicU64 = AtomicU64::new(0);
+/// Files [`forgotten`] keeps at most; their paths come from command parameters.
+pub(crate) const MAX_FORGOTTEN: usize = 64;
+/// The epoch [`forgotten`] was last emptied at.
+static EMPTIED: AtomicU64 = AtomicU64::new(0);
 /// A pending OS read stops being presented as normal loading after this long.
 #[cfg(not(target_arch = "wasm32"))]
 const READ_DEADLINE: Duration = Duration::from_secs(30);
@@ -97,18 +103,74 @@ fn infos() -> &'static Mutex<HashMap<String, Result<Arc<Info>, (String, Instant)
     I.get_or_init(Mutex::default)
 }
 
+/// When each file was last forgotten by itself. Taken after [`infos`] and the cache's lock where
+/// they are held. Emptied when full ([`forget_archive`]): reads asked for before that are read again.
+fn forgotten() -> &'static Mutex<HashMap<String, u64>> {
+    static F: OnceLock<Mutex<HashMap<String, u64>>> = OnceLock::new();
+    F.get_or_init(Mutex::default)
+}
+
+/// The epoch now, to tell later whether a file was forgotten since ([`forgotten_since`]).
+pub(crate) fn epoch() -> u64 {
+    EPOCH.load(Ordering::SeqCst)
+}
+
+/// Whether a tile address is of a file forgotten after `epoch`.
+pub(crate) fn forgotten_since(url: &str, epoch: u64) -> bool {
+    parse_url(url)
+        .is_some_and(|(_, _, _, archive)| forgotten().lock().unwrap_or_else(|e| e.into_inner()).get(archive).is_some_and(|at| *at > epoch))
+}
+
+/// How many files [`forgotten`] holds.
+#[cfg(test)]
+pub(crate) fn forgotten_len() -> usize {
+    forgotten().lock().unwrap_or_else(|e| e.into_inner()).len()
+}
+
+/// Whether a tile address was asked for at `epoch`, before [`forgotten`] last lost track of what it held.
+pub(crate) fn asked_before_emptied(url: &str, epoch: u64) -> bool {
+    is_tile(url) && epoch < EMPTIED.load(Ordering::SeqCst)
+}
+
 /// Forgets the files' metadata (with the tile cache), so they are read again.
 pub(crate) fn forget() {
     let mut all = infos().lock().unwrap_or_else(|e| e.into_inner());
-    EPOCH.fetch_add(1, Ordering::SeqCst);
+    CLEARED.store(EPOCH.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
     all.clear();
     drop(all);
     #[cfg(not(target_arch = "wasm32"))]
     rustgis_data::mbtiles::close_all();
 }
 
+/// Forgets what was read of one file (its metadata and its connections) with every file's resolved
+/// styles, made again when next drawn, and won't keep a read of it under way: the file may be
+/// replaced next. Reads of other files are kept, as they may be framing a map, until the record of
+/// forgotten files fills up ([`MAX_FORGOTTEN`]).
+/// [`cache::forget`](crate::cache::forget) asks this of any address, so others are left alone.
+pub(crate) fn forget_archive(archive: &str) {
+    if check(archive).is_err() {
+        return;
+    }
+    let mut all = infos().lock().unwrap_or_else(|e| e.into_inner());
+    let epoch = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut gone = forgotten().lock().unwrap_or_else(|e| e.into_inner());
+    if gone.len() >= MAX_FORGOTTEN && !gone.contains_key(archive) {
+        gone.clear();
+        EMPTIED.store(epoch, Ordering::SeqCst);
+        CLEARED.store(epoch, Ordering::SeqCst);
+    }
+    gone.insert(archive.to_string(), epoch);
+    drop(gone);
+    all.remove(archive);
+    drop(all);
+    crate::source::forget();
+    #[cfg(not(target_arch = "wasm32"))]
+    rustgis_data::mbtiles::close(file_of(archive));
+}
+
 /// An archive's metadata.
 pub fn info(archive: &str) -> Result<Arc<Info>, String> {
+    crate::cache::check_still(&crate::cache::current_still())?;
     check(archive)?;
     if is_upload(archive) {
         return upload(archive)
@@ -120,15 +182,21 @@ pub fn info(archive: &str) -> Result<Arc<Info>, String> {
     }
     let epoch = EPOCH.load(Ordering::SeqCst);
     let r = read_info(archive);
+    crate::cache::check_still(&crate::cache::current_still())?;
     remember_info(archive, &r, epoch);
     r
 }
 
-/// Keeps a completion only if no clear happened since its read started; check and insert share
-/// the same lock as the clear, so an old completion cannot repopulate the new cache.
+/// Keeps a completion only if neither its file nor every file was forgotten since its read started
+/// (a full clear, or the record of forgotten files emptied); check and insert share the same lock
+/// as the clear, so an old completion cannot repopulate the new cache.
 fn remember_info(archive: &str, result: &Result<Arc<Info>, String>, epoch: u64) {
+    if crate::cache::check_still(&crate::cache::current_still()).is_err() {
+        return;
+    }
     let mut all = infos().lock().unwrap_or_else(|e| e.into_inner());
-    if EPOCH.load(Ordering::SeqCst) != epoch {
+    let forgotten_at = forgotten().lock().unwrap_or_else(|e| e.into_inner()).get(archive).copied().unwrap_or(0);
+    if epoch < CLEARED.load(Ordering::SeqCst).max(forgotten_at) {
         return;
     }
     if all.len() >= 64 {
@@ -162,12 +230,20 @@ fn cached_info(archive: &str) -> Option<Result<Arc<Info>, String>> {
     })
 }
 
+/// The metadata workers' shared pending reads and completion signal.
+#[cfg(not(target_arch = "wasm32"))]
+fn metadata_reads() -> &'static (Mutex<HashMap<String, Instant>>, std::sync::Condvar) {
+    static LOADING: OnceLock<(Mutex<HashMap<String, Instant>>, std::sync::Condvar)> = OnceLock::new();
+    LOADING.get_or_init(|| (Mutex::new(HashMap::new()), std::sync::Condvar::new()))
+}
+
 /// Metadata without file I/O on the caller: local reads run in at most eight workers. A caller
 /// may wait up to `timeout`; otherwise `None` means pending. Completion wakes the map. Uploads
 /// are already in memory. At capacity a read remains pending until a later poll can start it.
 /// A read still pending after 30 seconds reports an error. A stalled OS read keeps its worker
 /// slot until it answers; those slots are never recycled into more potentially blocked threads.
 pub fn info_ready(archive: &str, timeout: Duration) -> Result<Option<Arc<Info>>, String> {
+    crate::cache::check_still(&crate::cache::current_still())?;
     check(archive)?;
     if is_upload(archive) {
         return info(archive).map(Some);
@@ -179,9 +255,7 @@ pub fn info_ready(archive: &str, timeout: Duration) -> Result<Option<Arc<Info>>,
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        use std::sync::Condvar;
-        static LOADING: OnceLock<(Mutex<HashMap<String, Instant>>, Condvar)> = OnceLock::new();
-        let (pending, ready) = LOADING.get_or_init(|| (Mutex::new(HashMap::new()), Condvar::new()));
+        let (pending, ready) = metadata_reads();
         let mut all = pending.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(result) = cached_info(archive) {
             return result.map(Some);
@@ -197,8 +271,11 @@ pub fn info_ready(archive: &str, timeout: Duration) -> Result<Option<Arc<Info>>,
             }
             all.insert(archive.to_string(), Instant::now());
             let address = archive.to_string();
+            let still = crate::cache::current_still();
             let spawned = std::thread::Builder::new().name("rustgis-mbtiles-info".into()).spawn(move || {
-                let _ = info(&address);
+                crate::cache::with_optional_still(still, || {
+                    let _ = info(&address);
+                });
                 pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&address);
                 ready.notify_all();
                 crate::cache::notify();
@@ -213,6 +290,9 @@ pub fn info_ready(archive: &str, timeout: Duration) -> Result<Option<Arc<Info>>,
             let (reads, _) = ready.wait_timeout_while(all, wait, |all| all.contains_key(archive)).unwrap_or_else(|e| e.into_inner());
             all = reads;
         }
+        drop(all);
+        crate::cache::check_still(&crate::cache::current_still())?;
+        let all = pending.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(result) = cached_info(archive) {
             return result.map(Some);
         }
@@ -223,10 +303,23 @@ pub fn info_ready(archive: &str, timeout: Duration) -> Result<Option<Arc<Info>>,
     }
 }
 
+/// The file an archive address names.
+#[cfg(not(target_arch = "wasm32"))]
+fn file_of(archive: &str) -> &std::path::Path {
+    std::path::Path::new(archive.strip_prefix("file://").unwrap_or(archive))
+}
+
+/// Closes the connections kept to files none of `archives` names, so another program can move or
+/// delete a file once no layer reads it.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn close_unused<'a>(archives: impl Iterator<Item = &'a str>) {
+    let kept: Vec<&std::path::Path> = archives.map(file_of).collect();
+    rustgis_data::mbtiles::close_unless(|file| kept.contains(&file));
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn read_info(archive: &str) -> Result<Arc<Info>, String> {
-    let path = std::path::Path::new(archive.strip_prefix("file://").unwrap_or(archive));
-    rustgis_data::mbtiles::open_path(path).map(Arc::new)
+    rustgis_data::mbtiles::open_path(file_of(archive)).map(Arc::new)
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -271,22 +364,107 @@ pub(crate) fn fetch(url: &str, done: Done) {
 pub(crate) fn read_local(url: &str) -> Result<Vec<u8>, String> {
     let (z, x, y, archive) = parse_url(url).ok_or_else(|| format!("{url}: not an MBTiles tile address"))?;
     check(archive)?;
-    let path = std::path::Path::new(archive.strip_prefix("file://").unwrap_or(archive));
-    Ok(rustgis_data::mbtiles::tile_path(path, z, x, y)?.unwrap_or_default())
+    Ok(rustgis_data::mbtiles::tile_path(file_of(archive), z, x, y)?.unwrap_or_default())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A reentrant authority check may clear metadata; the old epoch must still reject its result.
+    #[test]
+    fn metadata_completion_checks_still_outside_the_cache_lock() {
+        let _turn = crate::cache::turn();
+        let available = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = available.clone();
+        let still: crate::cache::Still = Arc::new(move || {
+            let free = infos().try_lock().is_ok();
+            seen.store(free, Ordering::SeqCst);
+            if free {
+                forget();
+            }
+            true
+        });
+        let epoch = EPOCH.load(Ordering::SeqCst);
+        let address = "/reentrant-cache-completion.mbtiles";
+        crate::cache::with_still(still, || remember_info(address, &Err("old completion".into()), epoch));
+        assert!(available.load(Ordering::SeqCst), "Still ran with the metadata cache locked");
+        assert!(cached_info(address).is_none(), "a clear during the predicate invalidates the earlier completion");
+    }
+
+    /// Both preflight and post-wait authority checks permit metadata reentry without a lock cycle.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn metadata_ready_checks_still_outside_the_pending_lock() {
+        let _turn = crate::cache::turn();
+        let origin = std::thread::current().id();
+        let available = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (free, count) = (available.clone(), checks.clone());
+        let still: crate::cache::Still = Arc::new(move || {
+            if std::thread::current().id() != origin {
+                return false;
+            }
+            count.fetch_add(1, Ordering::SeqCst);
+            free.fetch_and(metadata_reads().0.try_lock().is_ok(), Ordering::SeqCst);
+            true
+        });
+        let _ = crate::cache::with_still(still, || info_ready("/reentrant-pending-read.mbtiles", Duration::ZERO));
+        assert!(checks.load(Ordering::SeqCst) >= 2, "the post-wait check must execute");
+        assert!(available.load(Ordering::SeqCst), "Still ran with pending metadata reads locked");
+    }
+
+    /// The metadata worker inherits its initiating transport context instead of reading at root.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn metadata_worker_keeps_still_and_drops_revoked_completion() {
+        let _turn = crate::cache::turn();
+        let checks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let worker = checks.clone();
+        let still: crate::cache::Still = Arc::new(move || {
+            if std::thread::current().name() == Some("rustgis-mbtiles-info") {
+                worker.fetch_add(1, Ordering::SeqCst);
+                return false;
+            }
+            true
+        });
+        let address = "/revoked-metadata-worker.mbtiles";
+        let got = crate::cache::with_still(still, || info_ready(address, Duration::from_secs(10)));
+        assert!(matches!(got, Ok(None)), "revoked work must not populate metadata");
+        assert!(checks.load(Ordering::SeqCst) > 0, "the real worker checked the inherited context");
+        assert!(cached_info(address).is_none());
+        assert!(crate::cache::current_still().is_none());
+    }
+
     #[test]
     fn cleared_metadata_rejects_an_older_completion() {
+        let _turn = crate::cache::turn();
         let epoch = EPOCH.load(Ordering::SeqCst);
         forget();
         remember_info("/old-completion.mbtiles", &Err("obsolete read".into()), epoch);
         assert!(cached_info("/old-completion.mbtiles").is_none());
         remember_info("/fresh-completion.mbtiles", &Err("current read".into()), EPOCH.load(Ordering::SeqCst));
         assert!(cached_info("/fresh-completion.mbtiles").is_some());
+    }
+
+    /// The metadata of a read under way when its file was forgotten isn't kept; a read of another
+    /// file is, and an address that is no MBTiles file changes nothing.
+    #[test]
+    fn a_forgotten_file_rejects_only_its_own_older_completion() {
+        let _turn = crate::cache::turn();
+        let epoch = EPOCH.load(Ordering::SeqCst);
+        forget_archive("/forgotten-while-read.mbtiles");
+        remember_info("/forgotten-while-read.mbtiles", &Err("old file".into()), epoch);
+        assert!(cached_info("/forgotten-while-read.mbtiles").is_none());
+        // Tried several times: another test's clear may fall in between, but not every time.
+        assert!((0..100).any(|_| {
+            let epoch = EPOCH.load(Ordering::SeqCst);
+            forget_archive("/forgotten-while-read.mbtiles");
+            forget_archive("https://example.com/not-an-archive");
+            remember_info("/read-meanwhile.mbtiles", &Err("another file".into()), epoch);
+            cached_info("/read-meanwhile.mbtiles").is_some()
+        }));
+        assert!(!forgotten().lock().unwrap_or_else(|e| e.into_inner()).contains_key("https://example.com/not-an-archive"));
     }
 
     #[cfg(not(target_arch = "wasm32"))]

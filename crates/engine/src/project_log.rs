@@ -6,6 +6,29 @@ use serde_json::Value;
 
 use crate::{CmdResult, Session};
 
+/// A redacted output projection. Never use it as executable parameters or approval identity.
+pub struct LogCopy(Value);
+
+impl LogCopy {
+    /// Consumes the output-only wrapper for serialization.
+    pub fn into_log_value(self) -> Value {
+        self.0
+    }
+}
+
+/// The session log's bounded, document-aware parameter policy, shared with the agent audit.
+/// The source value is never mutated and remains the only input to execution and planning.
+pub fn log_params(params: &Value) -> LogCopy {
+    LogCopy(kept_params(params))
+}
+
+/// Cleans a structural command/tool identifier for display and audit output only.
+/// The original identifier remains the sole input to lookup, execution and approval.
+pub fn log_identifier(id: &str) -> String {
+    let public = crate::roles::identifier(id, &mut crate::durable::Report::default());
+    crate::durable::generated_text(public.as_deref().unwrap_or(id))
+}
+
 /// Now, in milliseconds since 1970 (UTC).
 pub(crate) fn now_ms() -> u64 {
     web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
@@ -115,10 +138,104 @@ fn kept_error(e: &str) -> String {
 /// `v` without secrets: as History's Copy as code takes them out (`history::redacted`), and,
 /// first, inside the JSON a text holds (a script's command lines: `s3.connect {"secret": …}`),
 /// whose objects are redacted in place.
+/// A bounded review's display projection, without the log's clipping. Never used for
+/// execution, consent equality or provenance; the policy retains its private original.
+pub(crate) fn review_params(v: &Value) -> Result<Value, String> {
+    review_value(v, 0)
+}
+
+/// Projects bounded review data recursively, including JSON held inside nested script strings.
+/// A card that cannot show its structure safely is refused; log/diagnostic clipping is separate.
+fn review_value(v: &Value, depth: usize) -> Result<Value, String> {
+    if depth > 32 {
+        return Err("too deeply nested to show in full; ask for a smaller request".into());
+    }
+    Ok(match v {
+        Value::Object(o) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in o {
+                let sensitive =
+                    rustgis_data::address::normalized_name(key).as_deref() != Some("key") && rustgis_data::address::log_sensitive(key);
+                let Value::String(public_key) = review_value(&Value::String(key.clone()), depth + 1)? else {
+                    return Err("a review field name must be text".into());
+                };
+                let value = if sensitive { Value::String(String::new()) } else { review_value(value, depth + 1)? };
+                if out.insert(public_key, value).is_some() {
+                    return Err("redacted field names cannot be distinguished; simplify the request".into());
+                }
+            }
+            crate::cmd::history::redacted(&Value::Object(out))
+        }
+        Value::Array(a) => Value::Array(a.iter().map(|v| review_value(v, depth + 1)).collect::<Result<_, _>>()?),
+        Value::String(text) => {
+            let mut out = String::new();
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find(['{', '[']) {
+                let (before, from) = rest.split_at(at);
+                out.push_str(before);
+                let mut values = serde_json::Deserializer::from_str(from).into_iter::<Value>();
+                match values.next() {
+                    Some(Ok(value @ (Value::Object(_) | Value::Array(_)))) => {
+                        let value = review_value(&value, depth + 1)?;
+                        out.push_str(&value.to_string());
+                        rest = from.get(values.byte_offset()..).unwrap_or("");
+                    }
+                    _ if from.get(1..).is_some_and(|r| r.trim_start().starts_with(['"', '\''])) || last_secret_name(from).is_some() => {
+                        return Err("structured text cannot be safely shown in full; simplify the request".into());
+                    }
+                    _ => {
+                        let first = from.chars().next().ok_or("empty structured text")?;
+                        out.push(first);
+                        rest = from.get(first.len_utf8()..).unwrap_or("");
+                    }
+                }
+            }
+            out.push_str(rest);
+            Value::String(crate::cmd::history::redacted_text(&sql_secrets_removed(&out)))
+        }
+        other => other.clone(),
+    })
+}
+
 fn redacted(v: &Value) -> Value {
     crate::cmd::history::redacted(&embedded_redacted(v, 0))
 }
 
+/// A bounded log-only context check for a short key beside nested connection settings.
+/// User data/documents do not make an ordinary join or lookup key a credential.
+pub(crate) fn address_context(key: &str, v: &Value, depth: usize) -> bool {
+    if depth >= 8 || matches!(key, "data" | "text" | "values" | "attributes" | "properties" | "features" | "geometry") {
+        return false;
+    }
+    match v {
+        Value::String(s) => {
+            let s = s.trim_start();
+            [
+                "http://",
+                "https://",
+                "s3://",
+                "rustgis-login:",
+                "rustgis-anonymous:",
+                "rustgis-s3:",
+                "postgres:",
+                "postgresql:",
+                "pg:",
+                "mysql:",
+                "mariadb:",
+                "mssql:",
+                "pmtiles:",
+                "cog:",
+            ]
+            .iter()
+            .any(|prefix| s.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix)))
+        }
+        Value::Array(values) => values.iter().take(LOG_LIST_ITEMS).any(|v| address_context("", v, depth + 1)),
+        Value::Object(values) => values.iter().any(|(key, v)| address_context(key, v, depth + 1)),
+        _ => false,
+    }
+}
+
+/// Scrubs bounded nested log parameters and JSON embedded in text before the log retains them.
 fn embedded_redacted(v: &Value, depth: usize) -> Value {
     match v {
         Value::String(t) => {
@@ -126,7 +243,17 @@ fn embedded_redacted(v: &Value, depth: usize) -> Value {
             Value::String(sql_secrets_removed(&t))
         }
         Value::Array(a) if depth < 8 => Value::Array(a.iter().map(|x| embedded_redacted(x, depth + 1)).collect()),
-        Value::Object(o) if depth < 8 => Value::Object(o.iter().map(|(k, x)| (k.clone(), embedded_redacted(x, depth + 1))).collect()),
+        Value::Object(o) if depth < 8 => Value::Object(
+            o.iter()
+                .map(|(k, x)| {
+                    // Preserve History's plain-key refinement; the log-only fields share diagnostics'
+                    // canonical list. Clipping already bounds recursion and text before this pass.
+                    let sensitive =
+                        rustgis_data::address::normalized_name(k).as_deref() != Some("key") && rustgis_data::address::log_sensitive(k);
+                    (k.clone(), if sensitive { Value::String(String::new()) } else { embedded_redacted(x, depth + 1) })
+                })
+                .collect(),
+        ),
         other => other.clone(),
     }
 }

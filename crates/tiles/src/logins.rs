@@ -90,9 +90,40 @@ struct Redaction {
     encoded: bool,
 }
 
-fn entries() -> MutexGuard<'static, BTreeMap<String, Entry>> {
+fn registry() -> &'static Mutex<BTreeMap<String, Entry>> {
     static ENTRIES: OnceLock<Mutex<BTreeMap<String, Entry>>> = OnceLock::new();
-    ENTRIES.get_or_init(Mutex::default).lock().unwrap_or_else(|e| e.into_inner())
+    ENTRIES.get_or_init(Mutex::default)
+}
+
+fn entries() -> MutexGuard<'static, BTreeMap<String, Entry>> {
+    registry().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// An exact runtime snapshot of one session's login generations, including their absence.
+/// It contains no credential and is never a display or persistence representation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AccountIdentity {
+    session: u64,
+    entries: Vec<(String, String, Method)>,
+}
+
+/// Captures only the initiating session's runtime bindings. Other sessions cannot invalidate it.
+/// Approval capture must fail closed when the runtime registry cannot be read consistently.
+pub fn account_identity(session: u64) -> Result<AccountIdentity, &'static str> {
+    let entries = registry().lock().map_err(|_| "The service login identity is unavailable.")?;
+    let entries = entries
+        .iter()
+        .filter(|(_, entry)| entry.owner.split_once('/').is_some_and(|(s, _)| s.parse::<u64>() == Ok(session)))
+        .map(|(binding, entry)| (binding.clone(), entry.origin.clone(), entry.method.clone()))
+        .collect();
+    Ok(AccountIdentity { session, entries })
+}
+
+impl AccountIdentity {
+    /// Poison or any change to this session's active binding generations refuses later work.
+    pub fn is_current(&self) -> bool {
+        account_identity(self.session).is_ok_and(|current| current == *self)
+    }
 }
 
 /// Installs a fresh session/connection login generation. Only addresses bound to the returned
@@ -101,6 +132,8 @@ pub fn activate(origin: &str, owner: &str, method: Method, value: &str, insecure
     activate_with_random(origin, owner, method, value, insecure, fill_random)
 }
 
+/// Validates the login before requesting entropy, then installs a fresh binding and its active
+/// output redactions together; failed validation or entropy leaves the registry unchanged.
 fn activate_with_random(
     origin: &str,
     owner: &str,
@@ -129,6 +162,15 @@ fn activate_with_random(
         && !payload.is_empty()
     {
         add_redactions(&mut redactions, payload);
+        // A server may echo the raw Basic password rather than its wire encoding. The complete
+        // header was bounded above, so decoding cannot allocate beyond that input's size.
+        if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(payload)
+            && let Ok(decoded) = std::str::from_utf8(&decoded)
+            && let Some((_, password)) = decoded.split_once(':')
+            && !password.is_empty()
+        {
+            add_redactions(&mut redactions, password);
+        }
     }
     let mut entries = entries();
     // A token is the only thing that scopes a bound address to its login, so it is random. A
@@ -264,10 +306,28 @@ fn append_percent_encoded(result: &mut String, value: &str) {
 /// Redacts active raw credentials, percent-encoded credentials (with either hex case), and
 /// the bare Base64 payload of Basic credentials. Matching the original input in one pass
 /// prevents overlapping values or a credential resembling `[redacted]` from leaking secrets.
+/// Matching covers every active login in this process; short passwords can replace ordinary
+/// text in another session's output. Revoked credentials are not retained for redaction.
 pub fn scrub(text: &str) -> String {
     let entries = entries();
+    if entries.is_empty() && !text.contains(rustgis_data::login_address::PREFIX) {
+        return text.to_string();
+    }
     let mut patterns: Vec<_> = entries.values().flat_map(|entry| &entry.redactions).collect();
     patterns.sort_unstable_by_key(|pattern| std::cmp::Reverse(pattern.value.expose().len()));
+    scrub_patterns(text, &patterns)
+}
+
+/// Cleans generated error text before active values can obscure its address syntax.
+/// Runtime request bindings and successful data values must not use this output projection.
+pub fn scrub_error(text: &str) -> String {
+    let unbound = scrub_patterns(text, &[]);
+    let (public, _) = rustgis_data::address::scrub_addresses(&unbound);
+    scrub(&public)
+}
+
+/// Removes runtime capability headers and the supplied active patterns in one pass.
+fn scrub_patterns(text: &str, patterns: &[&Redaction]) -> String {
     // Strip capabilities even after revocation, when there are no active credential patterns.
     let mut result = String::with_capacity(text.len());
     let mut rest = text;
@@ -523,13 +583,55 @@ mod tests {
         }
     }
 
+    /// Identity includes an empty session and ignores a different session with a shared prefix.
+    #[test]
+    fn runtime_identity_binds_session_generations_and_absence() {
+        let _turn = crate::cache::turn();
+        let session = 9_150_001;
+        let empty = account_identity(session).unwrap();
+        assert!(empty.is_current());
+        let unrelated =
+            activate("https://identity-login.example", "91500010/other", Method::Header("X-Key".into()), "synthetic-identity-other", false)
+                .unwrap();
+        assert!(empty.is_current());
+        let binding = activate(
+            "https://identity-login.example",
+            "9150001/connection",
+            Method::Header("X-Key".into()),
+            "synthetic-identity-first",
+            false,
+        )
+        .unwrap();
+        assert!(!empty.is_current());
+        let active = account_identity(session).unwrap();
+        assert!(active.is_current() && active == account_identity(session).unwrap());
+        assert!(deactivate(&unrelated));
+        assert!(active.is_current());
+        assert!(deactivate(&binding));
+        assert!(!active.is_current());
+        let replacement = activate(
+            "https://identity-login.example",
+            "9150001/connection",
+            Method::Header("X-Key".into()),
+            "synthetic-identity-first",
+            false,
+        )
+        .unwrap();
+        assert!(active != account_identity(session).unwrap(), "same credential is a new generation");
+        assert!(deactivate(&replacement));
+    }
+
     #[test]
     fn scrubs_header_and_basic_payload() {
         let _turn = crate::cache::turn();
-        let value = basic("scrub-user", "scrub-password");
+        let password = "scrub-password: /é";
+        let value = basic("scrub-user", password);
         let binding = activate("https://scrub-login.example", "scrub", Method::Header("Authorization".into()), &value, false).unwrap();
         let payload = value.strip_prefix("Basic ").unwrap();
         assert_eq!(scrub(&format!("{value} {payload} {}", percent_encode(&value))), "[redacted] [redacted] [redacted]");
+        assert_eq!(scrub(&format!("server echoed {password} {}", percent_encode(password))), "server echoed [redacted] [redacted]");
+        assert_eq!(scrub("scrub-user"), "scrub-user");
+        assert_eq!(scrub("a clean server message"), "a clean server message");
         let url = bind(&binding, "https://scrub-login.example/tile").unwrap();
         assert!(!scrub(&format!("failed: {url}")).contains(rustgis_data::login_address::PREFIX));
         assert_eq!(format!("{:?}", apply(&url).unwrap().unwrap()), "Applied(<redacted>)");

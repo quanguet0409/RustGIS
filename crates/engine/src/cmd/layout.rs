@@ -7,8 +7,8 @@ use rustgis_geom::{Coord, Extent};
 use rustgis_map::Rgba;
 use rustgis_map::layout::{
     Arrange, ArrowStyle, CoordFormat, ElementKind, FontFamily, FrameShape, Grid, GridEdges, GridKind, GridStyle, Guides, Layout, LineDir,
-    LineHead, MAX_COLORBAR_TICKS, MAX_GRID_WIDTH, MAX_GUIDES, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_ELEMENT_MM, MapSeries, Orientation,
-    PAGES, ScaleBarStyle, ScaleUnits, TextAlign, TickSide, fit_scale, line_angle, line_at_angle, line_length,
+    LineHead, MAX_COLORBAR_TICKS, MAX_GRID_WIDTH, MAX_GUIDES, MAX_LEGEND_COLUMNS, MAX_SCALE_DIVISIONS, MAX_TICK_MM, MIN_ELEMENT_MM,
+    MapSeries, Orientation, PAGES, ScaleBarStyle, ScaleUnits, TextAlign, TickSide, fit_scale, line_angle, line_at_angle, line_length,
 };
 use serde_json::{Value, json};
 
@@ -25,26 +25,26 @@ const MAX_LAYOUT: u64 = 64 << 20;
 
 pub fn commands() -> Vec<C> {
     vec![
-        C::new("layout.new", "New Layout", "Home › Project", new_layout).params(
+        C::new("layout.new", "New Layout", "Home › Project", new_layout).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"name"?: string, "page"?: "letter"|"legal"|"tabloid"|"a5"|"a4"|"a3"|"a2"|"a1"|"a0", "orientation"?: "landscape"|"portrait", "width"?: mm, "height"?: mm, "template"?: "map" (frame, title, legend, north arrow, scale bar; the default)|"blank"}"#,
         ),
-        C::new("layout.publication", "New Publication Layout", "Publish › Layout", publication).params(
+        C::new("layout.publication", "New Publication Layout", "Publish › Layout", publication).inputs(publication_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"profile"?: "a4" (the default) | "a3" | "a2" (a sheet turned to portrait or landscape, whichever the area's map comes out larger on: its extent east to west against north to south, on the map's projection) | "a4-portrait"|"a4-landscape"|"a3-portrait"|"a3-landscape"|"a2-portrait"|"a2-landscape" (a sheet: frame, title, subtitle, the map, a boxed footer)|"figure-1col" (90 mm)|"figure-1.5col" (140 mm)|"figure-2col" (190 mm)|"thesis-full" (160 × 225 mm)|"thesis-half" (160 × 110 mm) (a figure: the map edge to edge, its title and sources left to the caption), "extent"?: [west, south, east, north] in degrees that must fit (default: the map view), "name"?: string, "title"?: text, "subtitle"?: text, "sources"?: text | [texts], "reference"?: text | [texts] (default: the projection, datum and graticule), "note"?: text, "author"?: text (default: "Made with RustGIS · {date}"; "" or [] for none), "headings"?: [the sources' heading, the reference's heading, an editorial column's heading], "locator"?: "globe" (a globe with the area outlined; the default on sheets) | "inset" (the surrounding region, the area outlined) | "none" (the default on figures), "decimal"?: "." (the default) | "," (graticule, scale bar and colorbar numbers and {scale} with a decimal comma: 0,05 and 1:6.300.000), "style"?: "classic" (the default: the title over the map, the footer under it) | "banner" (the title and subtitle in a band of the accent colour across the top) | "panel" (the map at the left, a panel at the right with the title, locator, legend, sources and reference) | "editorial" (the title large in serif, a column at the right with the note, the locator and the legend) | "modular" (cards on a light page: the map, the locator and the legend each in one, the sources and reference in tinted ones) | "poster" (the page in the accent colour, the title in light text, the map in a light card, the footer in darker blocks) (a sheet's arrangement; figures leave it to the caption), "accent"?: a colour as #RRGGBB (the style's colour: its band, panel tint, headings and rules, a poster's page), "arrangement"?: "best" (the default: the favourite and each arrangement by name laid out, the one moving the least area off its corners kept, then the one leaving the least over the data, the favourite on a tie) | "favourite" (layout.arrangement's) | an arrangement by name or corner by corner, as layout.arrangement takes (the corners the locator, north arrow, legend and scale bar are at home in; one covering what the map draws there still moves)} → a new layout of the active map at a round scale, its texts wrapped to their boxes; {projection}, {datum} and {grid} in the texts are filled from the map"#,
         ),
-        C::new("layout.arrangement", "Favourite Arrangement", "Publish › Layout", arrangement).view().params(
+        C::new("layout.arrangement", "Favourite Arrangement", "Publish › Layout", arrangement).roles(&[]).effects(crate::policy::Effects::NONE).view().params(
             r#"{"favourite"?: "classic" (the locator top left, the north arrow top right, the legend bottom left, the scale bar bottom right) | "mirrored" | "legendRight" | "legendTop" | {"locator", "northArrow", "legend", "scaleBar": "top-left"|"top-right"|"bottom-left"|"bottom-right", each a corner of its own}} → the favourite arrangement of publication layouts (kept with the app's preferences), its corners and the arrangements by name; with no favourite given, it is only shown"#,
         ),
         C::new("layout.activate", "Open Layout", "Browser", |s, p| {
             let i = index(s, &by_name(p))?;
             s.active_layout = Some(i);
             Ok(json!({"layout": i}))
-        })
+        }).inputs(named_object_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .view()
         .params(r#"{"name": string | "layout": name|index}"#),
         C::new("layout.close", "Show Map", "Browser", |s, _| {
             s.active_layout = None;
             Ok(Value::Null)
-        })
+        }).inputs(close_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .view(),
         C::new("layout.remove", "Delete Layout", "Browser", |s, p| {
             let i = index(s, &by_name(p))?;
@@ -56,7 +56,7 @@ pub fn commands() -> Vec<C> {
                 _ => None,
             };
             Ok(Value::Null)
-        })
+        }).inputs(named_object_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name"?: string, "layout"?: name|index (instead of name; default: the open layout)}"#),
         C::new("layout.rename", "Rename Layout", "Browser", |s, p| {
             let name = ps(p, "newName").map(str::trim).filter(|n| !n.is_empty()).ok_or("newName is required")?;
@@ -67,7 +67,7 @@ pub fn commands() -> Vec<C> {
                 l.name = unique.clone();
             }
             Ok(json!({"name": unique}))
-        })
+        }).inputs(named_object_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name"?: string, "layout"?: name|index (instead of name; default: the open layout), "newName": string}"#),
         // A copy of a layout with all its elements (#288), right after it and open. Element ids
         // are per layout, so legends and scale bars stay on their frames, which show the same maps.
@@ -79,27 +79,27 @@ pub fn commands() -> Vec<C> {
             s.project.layouts.insert(i + 1, l);
             s.active_layout = Some(i + 1);
             Ok(json!({"name": name, "layout": i + 1}))
-        })
+        }).inputs(named_object_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"name"?: string, "layout"?: name|index (instead of name; default: the open layout), "newName"?: string (default: "<layout> copy")}"#),
-        C::new("layout.page", "Page Size", "Publish › Page Setup", page).params(
+        C::new("layout.page", "Page Size", "Publish › Page Setup", page).inputs(object_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layout"?, "page"?: page id, "orientation"?: "landscape"|"portrait", "width"?: mm, "height"?: mm, "decimal"?: "."|"," (the decimal mark of the numbers its surrounds print)}"#,
         ),
-        C::new("layout.addFrame", "Map Frame", "Publish › Map Frames", add_frame).params(
+        C::new("layout.addFrame", "Map Frame", "Publish › Map Frames", add_frame).inputs(add_frame_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layout"?, "shape"?: "rectangle"|"circle"|"ellipse"|"polygon"|"lasso", "points"?: [[u, v], …] (polygon/lasso, 0..1 across the frame), "map"?: name, "x"?, "y"?, "w"?, "h"?: mm}"#,
         ),
-        C::new("layout.addElement", "Add Element", "Publish › Map Surrounds", add_element).params(
-            r##"{"layout"?, "kind": "northArrow"|"scaleBar"|"legend"|"colorbar"|"text"|"dynamicText"|"picture"|"table"|"chart"|"rectangle" (a neatline framing the page unless any of x, y, w, h is given)|"ellipse"|"circle"|"line"|"arrow"|"extentIndicator"|"grid", "frame"?: element id (default: the first map frame), "of"?: frame id (extentIndicator, which also takes "color" and "width" in points, default red and 2), "text"?, "size"?, "color"?: "#RRGGBB"|"#RRGGBBAA" (text, dynamicText, line, arrow, rectangle, ellipse, circle: its outline; extentIndicator; grid; scaleBar; refused for other kinds), "bold"?: bool (text), "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50 (text, dynamicText), "font"?: "sans"|"serif"|an installed font family's name, as labels.fonts lists them (text, dynamicText; a family not installed here is drawn in its fallback, and a serif where none is installed in the sans, with a warning; refused for other kinds), "fallback"?: "sans"|"serif" (a named font's, where it isn't installed; default its own class, else sans), "title"?: legend title (default "Legend"), "allClasses"?: bool (legend: every class, not only those the frame draws), "hideOther"?: bool (legend: leave out <all other values>), "exclude"?: [layer names] (legend: layers it leaves out though the map draws them), "orientation"?: "horizontal"|"vertical" (colorbar), "ticks"?: 2..21 (colorbar: labelled values, ends included), "tickSide"?: "below"|"above"|"right"|"left" (colorbar), "reverse"?: bool (colorbar: high values first), "fill"?: "#RRGGBBAA" (rectangle, ellipse, circle, northArrow; scaleBar: the alternating bar's light divisions, default white; refused for other kinds), "width"?: outline width in points (rectangle, ellipse, circle; 0 for none) or line width in points (line, grid), "radius"?: mm, 0 to 50 (rectangle: rounded corners), "dir"?: "horizontal"|"vertical"|"falling"|"rising" (line), "head"?: "none"|"end"|"start"|"both" (line; default "end" for an arrow), "angle"?: degrees anticlockwise from pointing right, centred on the page unless x or y is given (line, arrow; it sets the box and the direction, so w, h and dir are not used with it), "length"?: mm (line, arrow), "image"?: base64, "path"?: picture file, "layer"?: (table, chart; colorbar: a raster layer, default the top visible one), "field"?, "label"?, "rows"?, "step"?: degrees, or a measured grid's units (metres) (0 picks one), "type"?: "graticule" (latitudes and longitudes, default) | "measured" (eastings and northings in a projected system, as ArcGIS Pro's measured grid), "crs"?: a measured grid's coordinate system: EPSG:25832, WKT or a PROJ string ("" or none: the map's when projected, else the UTM zone at the frame's centre), "short"?: bool (a measured grid's labels as their kilometres' last two digits, 43 for 543000), "labels"?: bool, "style"?: "lines"|"ticks"|"linesAndTicks" (grid) or "classic"|"compass"|"triangle"|"star" (northArrow) or "alternating"|"stepped"|"line" (scaleBar), "tickLength"?: mm, "format"?: "decimal"|"dms", "hemisphere"?: bool (N/S/E/W rather than a sign), "edges"?: ["top","bottom","left","right"] (labelled edges), "labelOrientation"?: "horizontal"|"vertical", "off"?: bool (grid; options not given keep the grid's), "outline"?: "#RRGGBB" (northArrow, or a rectangle's, ellipse's or circle's outline instead of color; refused for other kinds), "units"?: "auto"|"kilometers"|"meters"|"miles"|"feet", "divisions"?: 1..10 (scaleBar, whose "color" is its lines, dark divisions and labels, default #222222), "x"?, "y"?, "w"?, "h"?: mm}"##,
+        C::new("layout.addElement", "Add Element", "Publish › Map Surrounds", add_element).inputs(element_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
+            r##"{"layout"?, "kind": "northArrow"|"scaleBar"|"legend"|"colorbar"|"text"|"dynamicText"|"picture"|"table"|"chart"|"rectangle" (a neatline framing the page unless any of x, y, w, h is given)|"ellipse"|"circle"|"line"|"arrow"|"extentIndicator"|"grid", "frame"?: element id (default: the first map frame), "of"?: frame id (extentIndicator, which also takes "color" and "width" in points, default red and 2), "text"?, "size"?, "color"?: "#RRGGBB"|"#RRGGBBAA" (text, dynamicText, line, arrow, rectangle, ellipse, circle: its outline; extentIndicator; grid; scaleBar; refused for other kinds), "bold"?: bool (text), "italic"?: bool, "align"?: "left"|"center"|"right", "letterSpacing"?: points, -5 to 50 (text, dynamicText), "font"?: "sans"|"serif"|an installed font family's name, as labels.fonts lists them (text, dynamicText; a family not installed here is drawn in its fallback, and a serif where none is installed in the sans, with a warning; refused for other kinds), "fallback"?: "sans"|"serif" (a named font's, where it isn't installed; default its own class, else sans), "title"?: legend title (default "Legend"), "allClasses"?: bool (legend: every class, not only those the frame draws), "hideOther"?: bool (legend: leave out <all other values>), "exclude"?: [layer names] (legend: layers it leaves out though the map draws them), "columns"?: 1..3 (legend: the columns its rows are laid in; default 1), "orientation"?: "horizontal"|"vertical" (colorbar), "ticks"?: 2..21 (colorbar: labelled values, ends included), "tickSide"?: "below"|"above"|"right"|"left" (colorbar), "reverse"?: bool (colorbar: high values first), "fill"?: "#RRGGBBAA" (rectangle, ellipse, circle, northArrow; scaleBar: the alternating bar's light divisions, default white; refused for other kinds), "width"?: outline width in points (rectangle, ellipse, circle; 0 for none) or line width in points (line, grid), "radius"?: mm, 0 to 50 (rectangle: rounded corners), "dir"?: "horizontal"|"vertical"|"falling"|"rising" (line), "head"?: "none"|"end"|"start"|"both" (line; default "end" for an arrow), "angle"?: degrees anticlockwise from pointing right, centred on the page unless x or y is given (line, arrow; it sets the box and the direction, so w, h and dir are not used with it), "length"?: mm (line, arrow), "image"?: base64, "path"?: picture file, "layer"?: (table, chart; colorbar: a raster layer, default the top visible one), "field"?, "label"?, "rows"?, "step"?: degrees, or a measured grid's units (metres) (0 picks one), "type"?: "graticule" (latitudes and longitudes, default) | "measured" (eastings and northings in a projected system, as ArcGIS Pro's measured grid), "crs"?: a measured grid's coordinate system: EPSG:25832, WKT or a PROJ string ("" or none: the map's when projected, else the UTM zone at the frame's centre), "short"?: bool (a measured grid's labels as their kilometres' last two digits, 43 for 543000), "labels"?: bool, "style"?: "lines"|"ticks"|"linesAndTicks" (grid) or "classic"|"compass"|"triangle"|"star" (northArrow) or "alternating"|"stepped"|"line" (scaleBar), "tickLength"?: mm, "format"?: "decimal"|"dms", "hemisphere"?: bool (N/S/E/W rather than a sign), "edges"?: ["top","bottom","left","right"] (labelled edges), "labelOrientation"?: "horizontal"|"vertical", "off"?: bool (grid; options not given keep the grid's), "outline"?: "#RRGGBB" (northArrow, or a rectangle's, ellipse's or circle's outline instead of color; refused for other kinds), "units"?: "auto"|"kilometers"|"meters"|"miles"|"feet", "divisions"?: 1..10 (scaleBar, whose "color" is its lines, dark divisions and labels, default #222222), "x"?, "y"?, "w"?, "h"?: mm}"##,
         ),
-        C::new("layout.update", "Element Properties", "Publish › Element", update).params(
-            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "locked"?: bool (a locked element takes no other change until unlocked; "locked": false unlocks it and may come with changes), "text"?, "size"?, "color"? (text, line, rectangle, ellipse: its outline; scaleBar: its lines, dark divisions and labels; refused for other elements), "bold"?, "italic"?, "align"?, "letterSpacing"?, "font"?: "sans"|"serif"|an installed font family's name, "fallback"?: "sans"|"serif" (text, as in layout.addElement; refused for other elements), "title"?, "allClasses"?: bool (legend), "hideOther"?: bool (legend), "exclude"?: [layer names] (legend; [] lists every layer again), "orientation"?, "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "fill"?, "outline"? (northArrow, rectangle, ellipse, and a scaleBar's fill; refused for other elements; for a rectangle or ellipse, color sets it when outline is not given; a scaleBar's fill is the alternating bar's light divisions), "radius"?: mm (rectangle: rounded corners), "width"?: points (rectangle, ellipse, line), "dir"?, "head"?, "angle"?, "length"? (line: turned or sized about its centre, then moved by any x or y; dir does not come with angle or length), "units"?, "divisions"? (scaleBar), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "layer"?: (colorbar: "" for the top visible raster), "field"?, "rows"?}"##,
+        C::new("layout.update", "Element Properties", "Publish › Element", update).inputs(update_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files)).params(
+            r##"{"layout"?, "element": id, "x"?, "y"?, "w"?, "h"?: mm, "name"?, "visible"?, "locked"?: bool (a locked element takes no other change until unlocked; "locked": false unlocks it and may come with changes), "text"?, "size"?, "color"? (text, line, rectangle, ellipse: its outline; scaleBar: its lines, dark divisions and labels; refused for other elements), "bold"?, "italic"?, "align"?, "letterSpacing"?, "font"?: "sans"|"serif"|an installed font family's name, "fallback"?: "sans"|"serif" (text, as in layout.addElement; refused for other elements), "title"?, "allClasses"?: bool (legend), "hideOther"?: bool (legend), "exclude"?: [layer names] (legend; [] lists every layer again), "columns"?: 1..3 (legend), "orientation"?, "ticks"?, "tickSide"?, "reverse"?: (colorbar), "style"?: (northArrow, scaleBar), "fill"?, "outline"? (northArrow, rectangle, ellipse, and a scaleBar's fill; refused for other elements; for a rectangle or ellipse, color sets it when outline is not given; a scaleBar's fill is the alternating bar's light divisions), "radius"?: mm (rectangle: rounded corners), "width"?: points (rectangle, ellipse, line), "dir"?, "head"?, "angle"?, "length"? (line: turned or sized about its centre, then moved by any x or y; dir does not come with angle or length), "units"?, "divisions"? (scaleBar), "map"?, "scale"?, "center"?: [lon, lat], "bearing"?: degrees clockwise from north, "pitch"?: degrees of tilt (0 to 85), "grid"?: {grid options as in layout.addElement} | false (map frame), "extentIndicator"?: {"color"?, "width"?: points} | false (map frame: its extent indicator's style, or removes it), "layer"?: (colorbar: "" for the top visible raster), "field"?, "rows"?}"##,
         ),
-        C::new("layout.guides", "Guides", "Publish › Page Setup", guides).params(
+        C::new("layout.guides", "Guides", "Publish › Page Setup", guides).inputs(object_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layout"?, "x"?: [mm] (vertical guides, from the page's left edge), "y"?: [mm] (horizontal guides, from its top edge), "clear"?: bool (remove every guide first)}"#,
         ),
-        C::new("layout.duplicateElement", "Duplicate Element", "Publish › Element", duplicate_element).params(
+        C::new("layout.duplicateElement", "Duplicate Element", "Publish › Element", duplicate_element).inputs(object_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layout"?, "element": id, "dx"?, "dy"?: mm (offset of the copy, default 5)}"#,
         ),
-        C::new("layout.arrange", "Arrange Element", "Publish › Element", arrange).params(
+        C::new("layout.arrange", "Arrange Element", "Publish › Element", arrange).inputs(object_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layout"?, "element": id, "to": "front"|"forward"|"backward"|"back" (later elements are drawn over earlier ones: front puts it over every other, forward over the one above it, backward under the one below, back under every other)}"#,
         ),
         C::new("layout.removeElement", "Delete Element", "Publish › Element", |s, p| {
@@ -110,18 +110,18 @@ pub fn commands() -> Vec<C> {
                 unlocked(l, locked)?;
             }
             if l.remove(id) { Ok(Value::Null) } else { Err(format!("no element {id}")) }
-        })
+        }).inputs(object_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
         .params(r#"{"layout"?, "element": id}"#),
-        C::new("layout.frameZoom", "Zoom Frame", "Publish › Map Frame", frame_zoom).params(
+        C::new("layout.frameZoom", "Zoom Frame", "Publish › Map Frame", frame_zoom).inputs(frame_zoom_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layout"?, "element"?: frame id, "frame"?: (as element), "to"?: "view" (the map view's extent, bearing and pitch; the default)|"full"|"selection"|"layer", "layer"?}"#,
         ),
-        C::new("layout.series", "Map Series", "Publish › Map Frames", series).params(
+        C::new("layout.series", "Map Series", "Publish › Map Frames", series).inputs(series_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"layout"?, "layer": index layer, "nameField"?: string, "frame"?: id, "margin"?: 0..1, "off"?: bool}"#,
         ),
-        C::new("layout.seriesPage", "Map Series Page", "Publish › Map Frames", series_page).params(r#"{"layout"?, "page": number|"next"|"previous"}"#),
-        C::new("layout.seriesRefresh", "Refresh Map Series", "Publish › Map Frames", |s, p| series_page(s, &json!({"layout": p.get("layout"), "page": "current"})))
+        C::new("layout.seriesPage", "Map Series Page", "Publish › Map Frames", series_page).inputs(series_page_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(r#"{"layout"?, "page": number|"next"|"previous"}"#),
+        C::new("layout.seriesRefresh", "Refresh Map Series", "Publish › Map Frames", |s, p| series_page(s, &json!({"layout": p.get("layout"), "page": "current"}))).inputs(series_page_inputs).roles(&[]).effects(crate::policy::Effects::NONE)
             .params(r#"{"layout"?}"#),
-        C::new("layout.export", "Export Layout", "Publish › Output", |s, p| super::exports::write_here(s, p, "layout.export"))
+        C::new("layout.export", "Export Layout", "Publish › Output", |s, p| super::exports::write_here(s, p, "layout.export")).inputs(layout_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"layout"?, "path": "*.png|*.pdf|*.svg" (PNG/SVG: current page; SVG: each element a group of its own; text and shapes as SVG, map frames and surrounds as vectors, rasters and tiles in them as pictures at dpi), "dpi"?: 72..600, "allPages"?: bool (PDF only; default true: every map series page, up to 500; false: the current page)}"#),
         C::new("layout.save", "Save Layout File", "Publish › Save As", |s, p| {
@@ -130,7 +130,7 @@ pub fn commands() -> Vec<C> {
             let text = serde_json::to_string_pretty(&l).map_err(|e| e.to_string())?;
             rustgis_data::io::write_atomic(Path::new(path), text.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
             Ok(json!({"path": path}))
-        })
+        }).inputs(object_inputs).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .view()
         .params(r#"{"layout"?, "path": "*.rgislayout"}"#),
         C::new("layout.import", "Import Layout", "Home › Project", |s, p| {
@@ -143,13 +143,15 @@ pub fn commands() -> Vec<C> {
                 (None, None) => return Err("path or text is required".into()),
             };
             import(s, &text)
-        })
+        }).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
         .params(r#"{"path"?: "*.rgislayout", "text"?: layout JSON}"#),
     ]
 }
 
 /// The layout named or numbered by `layout`, else the active one, else the only one.
-fn index(s: &Session, p: &Value) -> Result<usize, String> {
+fn index(input: &impl super::InputSource, p: &Value) -> Result<usize, String> {
+    let context = input.input_context();
+    let s = &context;
     let ls = &s.project.layouts;
     // A `layout` that is neither a name nor an index is an error, never the open layout.
     match p.get("layout") {
@@ -298,7 +300,14 @@ pub(crate) fn new_layout(s: &mut Session, p: &Value) -> CmdResult {
             l.add(
                 "Legend",
                 (side, m + 16.0, sw, fh * 0.6),
-                ElementKind::Legend { frame, title: "Legend".into(), all_classes: false, hide_other: false, exclude: Vec::new() },
+                ElementKind::Legend {
+                    frame,
+                    title: "Legend".into(),
+                    all_classes: false,
+                    hide_other: false,
+                    exclude: Vec::new(),
+                    columns: 1,
+                },
             );
             l.add("North Arrow", (side + sw / 2.0 - 8.0, m + 16.0 + fh * 0.62, 16.0, 24.0), ElementKind::north_arrow(frame));
             l.add("Scale Bar", (side, m + 16.0 + fh * 0.62 + 28.0, sw, 12.0), ElementKind::scale_bar(frame));
@@ -618,6 +627,41 @@ pub(crate) fn legend_room(
     Some((w.min(room_w.max(MIN_LEGEND_MM)), h.min(room_h.max(MIN_LEGEND_MM))))
 }
 
+/// Whether a publication legend laid out in more columns beats it in fewer, each as the share of it
+/// shown and the area (mm²) the surrounds leave over the drawing: it shows more of itself, or as
+/// much and covers at least a quarter less, as a low wide box does above a map's data (#1379).
+pub(crate) fn more_columns_win((shown, over): (f64, f64), (best_shown, best_over): (f64, f64)) -> bool {
+    shown > best_shown + 1e-6 || (shown > best_shown - 1e-6 && over < 0.75 * best_over)
+}
+
+/// The width and height, in cells, of the largest rectangle with no drawn cell in
+/// `(c0, r0, c1, r1)` of a grid `gw` cells wide, its cells row by row: where a legend's shape can
+/// go (#1379).
+pub(crate) fn largest_free_cells(gw: usize, cells: &[bool], (c0, r0, c1, r1): (usize, usize, usize, usize)) -> (usize, usize) {
+    let mut heights = vec![0usize; c1.saturating_sub(c0) + 1];
+    let (mut best, mut stack) = ((0, 0), Vec::<usize>::new());
+    for r in r0..r1 {
+        for c in c0..c1 {
+            let free = !cells.get(r * gw + c).copied().unwrap_or(true);
+            heights[c - c0] = if free { heights[c - c0] + 1 } else { 0 };
+        }
+        // Each column's height from this row up: the widest run at least that high, by a stack of
+        // rising heights. The last entry stays 0, so every run ends.
+        stack.clear();
+        for i in 0..heights.len() {
+            while let Some(&top) = stack.last().filter(|&&top| heights[top] >= heights[i]) {
+                stack.pop();
+                let wide = stack.last().map_or(i, |&left| i - left - 1);
+                if wide * heights[top] > best.0 * best.1 {
+                    best = (wide, heights[top]);
+                }
+            }
+            stack.push(i);
+        }
+    }
+    best
+}
+
 /// A publication layout's colorbar's height, in mm: its title, the bar and its labels.
 const COLORBAR_MM: f64 = 15.0;
 
@@ -856,21 +900,7 @@ fn landscape_suits(aspect: f64, short: f64, long: f64, style: Style) -> bool {
 /// subtitle and a footer of two boxed columns (sources, cartographic reference) with a note and
 /// authorship under them, each text wrapped to its box with the layout's own font.
 fn publication(s: &mut Session, p: &Value) -> CmdResult {
-    let id = match p.get("profile").filter(|v| !v.is_null()) {
-        None => "a4".to_string(),
-        Some(v) => v.as_str().map(|t| t.trim().to_ascii_lowercase()).ok_or("profile is a profile's name, such as \"a4-portrait\"")?,
-    };
-    // A sheet's size alone ("a4", the default): its orientation chosen below, from the area's
-    // shape, portrait until then.
-    let auto = matches!(id.as_str(), "a4" | "a3" | "a2").then(|| id.clone());
-    let id = match &auto {
-        Some(size) => format!("{size}-portrait"),
-        None => id,
-    };
-    let profile = PUBLICATION_PROFILES.iter().find(|pr| pr.id == id).ok_or_else(|| {
-        let names: Vec<&str> = PUBLICATION_PROFILES.iter().map(|pr| pr.id).collect();
-        format!("unknown profile '{id}': a4, a3 or a2 (turned to the area's shape), {}", names.join(", "))
-    })?;
+    let (auto, profile) = publication_profile(p)?;
     let (sheet, page_w, page_h) = (profile.sheet, profile.width, profile.height);
     let extent = match p.get("extent").filter(|v| !v.is_null()) {
         // The view; on a globe the whole Earth, as geoprocessing takes it (the globe camera's flat
@@ -906,21 +936,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     };
     let headings = texts_of(p, "headings")?.unwrap_or_default();
     let comma = decimal_mark(p)?.unwrap_or(false);
-    let locator = match p.get("locator").filter(|v| !v.is_null()) {
-        None => {
-            if sheet {
-                Locator::Globe
-            } else {
-                Locator::None
-            }
-        }
-        Some(v) => match v.as_str().map(str::trim) {
-            Some("globe") => Locator::Globe,
-            Some("inset") => Locator::Inset,
-            Some("none") => Locator::None,
-            _ => return Err("locator is \"globe\", \"inset\" or \"none\"".into()),
-        },
-    };
+    let locator = publication_locator(p, sheet)?;
     // A style or an accent that isn't text is refused, as an unknown one is, rather than left out.
     for k in ["style", "accent"] {
         if p.get(k).is_some_and(|v| !v.is_null() && !v.is_string()) {
@@ -1605,27 +1621,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
             // A locator an earlier sheet made that no layout shows any more (its layout deleted)
             // is replaced, so sheets made again and again don't leave a trail of them; one still
             // shown is kept, and the new one numbered beside it.
-            let shown = |n: &str| {
-                s.project
-                    .layouts
-                    .iter()
-                    .flat_map(|l| &l.elements)
-                    .any(|e| matches!(&e.kind, ElementKind::MapFrame { map, .. } if map.eq_ignore_ascii_case(n)))
-            };
-            let ours = |n: &str| {
-                n.strip_prefix(base.as_str())
-                    .is_some_and(|rest| rest.is_empty() || rest.strip_prefix(' ').is_some_and(|k| k.parse::<u32>().is_ok()))
-            };
-            // And made as this command makes them: no web tiles, only unlabelled polygon layers,
-            // so a globe map made by hand under that name is left alone.
-            let made_here = |x: &rustgis_map::Map| {
-                x.tiles.is_empty() && x.layers.iter().all(|l| l.geometry_type() == rustgis_data::GeometryType::Polygon && !l.labels.enabled)
-            };
-            let orphan = s
-                .project
-                .maps
-                .iter()
-                .position(|x| x.projection.is_globe() && ours(&x.name) && !shown(&x.name) && x.name != src.name && made_here(x));
+            let orphan = locator_orphan(s);
             let name = match orphan.and_then(|i| s.project.maps.get(i)) {
                 Some(x) => x.name.clone(),
                 None => numbered(&base, |n| s.project.maps.iter().any(|x| x.name.eq_ignore_ascii_case(n))),
@@ -1726,8 +1722,9 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     };
     let lonlat = crate::render::view_lonlat(s.map(), &view);
     let reading = s.map_mut().sync_sources(&lonlat, render_scale, true);
-    let (mut cw, mut ch) = match crate::render::layout::legend_size_mm(s.map_mut(), render_scale, false, false, &[]) {
-        Some(size) => size,
+    let mut sizes = crate::render::layout::legend_sizes_mm(s.map_mut(), render_scale, false, false, &[]);
+    let (mut cw, mut ch) = match sizes {
+        Some(sizes) => sizes[0],
         None => {
             // A complete source that can't be read: the export says why; the legend is sized by hand.
             warnings.push("a layer's source couldn't be read through, so the legend has a fixed size; exporting says why".into());
@@ -1737,10 +1734,12 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     let listed = s.map().layers.iter().any(|l| s.map().shows(l) && !l.graphics && !l.is_raster());
     if reading && listed {
         (cw, ch) = (cw.max(fw * 0.3), ch.max(fh * 0.25));
+        sizes = None;
         warnings.push("the legend's classes aren't known yet (a layer still reading): it has a fixed size to fit by hand".into());
     } else if crate::render::layout::tile_legends_pending(s.map(), render_scale, &[]) {
         // Not waited for: a slow legend server would hold the command up.
         (cw, ch) = (cw.max(fw * 0.3), ch.max(fh * 0.25));
+        sizes = None;
         warnings.push("a WMS or WMTS layer's legend picture is still loading: the legend has a fixed size to fit by hand".into());
     }
     let (sw, sh, nh) = ((fw * 0.3).max(25.0), if sheet { 8.0 * k } else { 6.0 }, pitch(small_pt) + 0.5);
@@ -1809,18 +1808,22 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
         Surround::Scale => "scale bar",
     };
     let area = (fx + left, fy + top, fx + fw - right, fy + fh - bottom);
-    // An arrangement laid out (#1379): each surround over the map in its own corner, the legend
-    // short of the surrounds beside and above or below it (`None` when the locator leaves it too
-    // small, so it is left out); then, the largest first, each one covering what the map draws there
-    // leaves it for the freest place in the frame, clear of those placed before it ([`free_spot`]),
-    // when that covers less, and one whose corner a larger one took leaves it in any case. Data
-    // everywhere alike leaves nowhere better: it stays. Gives the legend's corner and size, each
-    // surround's place, the ones moved, and the area (mm²) of those moved and of what still covers
-    // the drawing.
+    // An arrangement laid out (#1379), the legend's box `legend` at most: each surround over the map
+    // in its own corner, the legend short of the surrounds beside and above or below it (`None` when
+    // the locator leaves it too small, so it is left out); then, the largest first, each one covering
+    // what the map draws there leaves it for the freest place in the frame, clear of those placed
+    // before it ([`free_spot`]), when that covers less, and one whose corner a larger one took leaves
+    // it in any case. Data everywhere alike leaves nowhere better: it stays. Gives the legend's corner
+    // and size, each surround's place, the ones moved, and the area (mm²) of those moved and of what
+    // still covers the drawing.
     type Laid = (Option<(usize, f64, f64)>, Vec<(Surround, Rect)>, Vec<&'static str>, (f64, f64));
-    let lay_out = |homes: Homes| -> Laid {
-        let corner_of =
-            |what: Surround| surrounds.iter().find(|(kind, ..)| *kind == what).map(|&(kind, w, h)| (homes[home_slot(kind)], w, h));
+    let lay_out = |homes: Homes, legend: (f64, f64)| -> Laid {
+        let corner_of = |what: Surround| {
+            surrounds.iter().find(|(kind, ..)| *kind == what).map(|&(kind, w, h)| {
+                let (w, h) = if kind == Surround::Legend { legend } else { (w, h) };
+                (homes[home_slot(kind)], w, h)
+            })
+        };
         let legend_at = corner_of(Surround::Legend).and_then(|(corner, w, h)| {
             let other = |c: usize| surrounds.iter().find(|&&(kind, ..)| homes[home_slot(kind)] == c).copied();
             let beside = other(corner ^ 1).map(|(kind, ow, _)| (kind, ow));
@@ -1862,19 +1865,68 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
         // A legend left out costs the whole frame, more than any move, so an arrangement that keeps
         // it always wins over one that drops it.
         let dropped = if surrounds.iter().any(|x| x.0 == Surround::Legend) && legend_at.is_none() { fw * fh } else { 0.0 };
+        // A legend cut short of its neighbours costs ten times what it loses, so one that keeps its
+        // rows beats moving another surround.
+        let cut = legend_at.map_or(0.0, |(_, lw, lh)| 10.0 * (legend.0 * legend.1 - lw * lh).max(0.0));
         // Surrounds left over each other (nowhere clear for one a larger one's corner took) cost ten
         // times their overlap, so an arrangement that keeps them apart wins.
         let clash = 10.0 * overlap_area(&spots.iter().map(|(_, r)| *r).collect::<Vec<_>>());
-        (legend_at, spots, moved, (shifted + dropped + clash, over))
+        (legend_at, spots, moved, (shifted + dropped + cut + clash, over))
     };
     // Each arrangement tried laid out, and one picked ([`pick_arrangement`]): the least area moved
     // off its corners (so a north arrow moved costs less than a legend), then the least left over
     // the drawing, the first tried (the favourite) on a tie. Every arrangement fills the same four
     // corners, so it is what goes where that differs. A single arrangement asked for is the one
     // laid out.
-    let mut laid: Vec<(Homes, Laid)> = tries.iter().map(|h| (*h, lay_out(*h))).collect();
-    let chosen = pick_arrangement(&laid.iter().map(|(_, l)| l.3).collect::<Vec<_>>()).map(|i| laid.swap_remove(i));
-    let (homes, (legend_at, spots, moved, _)) = chosen.unwrap_or_else(|| (ARRANGEMENTS[0].1, lay_out(ARRANGEMENTS[0].1)));
+    let arranged = |legend: (f64, f64)| -> (Homes, Laid) {
+        let mut laid: Vec<(Homes, Laid)> = tries.iter().map(|h| (*h, lay_out(*h, legend))).collect();
+        let chosen = pick_arrangement(&laid.iter().map(|(_, l)| l.3).collect::<Vec<_>>()).map(|i| laid.swap_remove(i));
+        chosen.unwrap_or_else(|| (ARRANGEMENTS[0].1, lay_out(ARRANGEMENTS[0].1, legend)))
+    };
+    let at_most_one = surrounds.iter().find(|x| x.0 == Surround::Legend).map_or((0.0, 0.0), |x| (x.1, x.2));
+    let mut legend_cols = 1;
+    let mut best = arranged(at_most_one);
+    // The legend takes the fewest columns that fit the largest rectangle the map leaves free
+    // (#1379). Past those, or when none fits, a long one is tried in more, up to the width beside
+    // the north arrow, when in fewer it is cut or over what the map draws. One in a side column
+    // stays in one: that column is about as wide as its rows.
+    if let Some(sizes) = sizes.filter(|_| column.is_none() && content_h > 0.0) {
+        let whole = |(w, h): (f64, f64)| ((if bar.is_some() { w.max(bar_w) } else { w }) + 2.0 * pad, h + bar_part + 2.0 * pad);
+        let shown = |laid: &Laid, (w, h): (f64, f64)| laid.0.map_or(0.0, |(_, lw, lh)| (lw / w).min(1.0) * (lh / h).min(1.0));
+        let long = whole(sizes[0]).1 > fh * 0.25;
+        let mut score = (shown(&best.1, whole(sizes[0])), best.1.3.1);
+        let wide = fw - left - right - 2.0 - aw;
+        let free = coverage.as_ref().map(|(gw, gh, cells)| {
+            let (gw, gh) = (*gw as usize, *gh as usize);
+            let col = |v: f64| ((v - fx) / fw * gw as f64).clamp(0.0, gw as f64) as usize;
+            let row = |v: f64| ((v - fy) / fh * gh as f64).clamp(0.0, gh as f64) as usize;
+            let (cw, ch) = largest_free_cells(gw, cells, (col(area.0), row(area.1), col(area.2), row(area.3)));
+            (cw as f64 * fw / gw as f64, ch as f64 * fh / gh as f64)
+        });
+        let fits = free.and_then(|(rw, rh)| sizes.iter().position(|size| whole(*size).0 <= rw && whole(*size).1 <= rh));
+        // One column too, when the rectangle holds what the box a legend starts with cuts.
+        if let Some(i) = fits.filter(|i| *i > 0 || whole(sizes[0]).0 > at_most_one.0 + 1e-6 || whole(sizes[0]).1 > at_most_one.1 + 1e-6) {
+            let (w, h) = whole(sizes[i]);
+            let more = arranged((w.min(wide), h));
+            let new = (shown(&more.1, (w, h)), more.1.3.1);
+            if more.1.0.is_some() && new.0 >= score.0 - 1e-6 {
+                (legend_cols, best, score) = (i + 1, more, new);
+            }
+        }
+        for (i, size) in sizes.iter().enumerate().skip(legend_cols) {
+            if score.0 > 1.0 - 1e-6 && (!long || score.1 <= LEAK * fw * fh) {
+                break;
+            }
+            let (w, h) = whole(*size);
+            let more = arranged((w.min(wide), h.min(fh * 0.6)));
+            let new = (shown(&more.1, (w, h)), more.1.3.1);
+            if more.1.0.is_some() && more_columns_win(new, score) {
+                (legend_cols, best, score) = (i + 1, more, new);
+            }
+        }
+        (cw, ch) = sizes[legend_cols - 1];
+    }
+    let (homes, (legend_at, spots, moved, _)) = best;
     if surrounds.iter().any(|x| x.0 == Surround::Legend) && legend_at.is_none() {
         warnings.push(
             "the frame leaves the legend no room beside the locator, so it is left out: give the map more room, or set \"locator\": \"none\""
@@ -1950,21 +2002,23 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
         let (ix, iy, iw, ih) = (r.0 + pad, r.1 + pad, lw - 2.0 * pad, lh - 2.0 * pad);
         let bar_fit = if bar.is_some() { bar_h.min(ih) } else { 0.0 };
         let rows_h = (ih - bar_fit - if bar.is_some() { bar_part - bar_h } else { 0.0 }).max(0.0);
-        // A box sized to its content, less the padding again, can come out a rounding error
-        // short of it: that still fits.
-        const FIT_MM: f64 = 1e-6;
-        if ch > 0.0 && (cw > iw + FIT_MM || ch > rows_h + FIT_MM) {
-            warnings.push("the legend lists more than fits its corner: its last rows or the ends of long labels are left out".into());
-        }
+        warnings.extend(legend_fit_warnings(legend_cols, (cw, ch), (iw, rows_h)).into_iter().map(String::from));
         // In a column the colorbar takes the column's width, as its rows do.
-        if bar.is_some() && ((bar_w > iw + FIT_MM && !legend_in_column) || bar_h > ih + FIT_MM) {
+        if bar.is_some() && ((bar_w > iw + LEGEND_FIT_MM && !legend_in_column) || bar_h > ih + LEGEND_FIT_MM) {
             warnings.push("the legend's box is smaller than the colorbar: it is drawn narrower or shorter".into());
         }
         if ch > 0.0 && rows_h >= 1.0 {
             l.add(
                 "Legend",
                 (ix, iy, iw, rows_h),
-                ElementKind::Legend { frame, title: String::new(), all_classes: false, hide_other: false, exclude: Vec::new() },
+                ElementKind::Legend {
+                    frame,
+                    title: String::new(),
+                    all_classes: false,
+                    hide_other: false,
+                    exclude: Vec::new(),
+                    columns: legend_cols,
+                },
             );
         }
         if let Some(layer) = &bar {
@@ -2030,7 +2084,7 @@ fn publication(s: &mut Session, p: &Value) -> CmdResult {
     s.active_layout = Some(i);
     let locator = locator_map.map(|(map, ..)| map);
     Ok(
-        json!({"layout": i, "name": name, "profile": profile.id, "page": [w, h], "scale": scale, "grid": step, "locator": locator, "style": style.code(), "arrangement": arrangement_name(homes), "elements": elements, "moved": moved, "warnings": warnings}),
+        json!({"layout": i, "name": name, "profile": profile.id, "page": [w, h], "scale": scale, "grid": step, "locator": locator, "style": style.code(), "arrangement": arrangement_name(homes), "legendColumns": legend_cols, "elements": elements, "moved": moved, "warnings": warnings}),
     )
 }
 
@@ -2168,12 +2222,7 @@ fn add_frame(s: &mut Session, p: &Value) -> CmdResult {
         }
         o => return Err(format!("unknown frame shape '{o}'")),
     };
-    let map = match ps(p, "map") {
-        Some(n) => {
-            s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(n)).map(|m| m.name.clone()).ok_or_else(|| format!("no map '{n}'"))?
-        }
-        None => s.map().name.clone(),
-    };
+    let map = added_frame_map(s, p)?.name.clone();
     let i = index(s, p)?;
     let l = s.project.layouts.get(i).ok_or("no layout")?;
     let n = l.elements.len() as f64;
@@ -2217,10 +2266,77 @@ pub(crate) fn color(p: &Value, k: &str, d: Rgba) -> Result<Rgba, String> {
     }
 }
 
+const ONLY_LEGEND_COLUMNS: &str = "only legends have columns";
+
+/// A box sized to its content, less the padding again, can come out a rounding error short of it:
+/// that still fits.
+const LEGEND_FIT_MM: f64 = 1e-6;
+
+/// What a legend's rows `size` in `columns` columns lose in a box `room`, in mm, each said once.
+fn legend_fit_warnings(columns: usize, (w, h): (f64, f64), (room_w, room_h): (f64, f64)) -> Vec<&'static str> {
+    // With no rows there is nothing to lose, in a box shorter than its title too.
+    let (too_wide, too_tall) = (h > 0.0 && w > room_w + LEGEND_FIT_MM, h > 0.0 && h > room_h + LEGEND_FIT_MM);
+    let mut said = Vec::new();
+    if columns > 1 {
+        // Its columns close up rather than leave one out.
+        if too_wide {
+            said.push("the legend's columns are wider than its box: they close up, long labels run into the next, and the last column's past the box");
+        }
+        if too_tall {
+            said.push("the legend lists more than fits its box: its last rows are left out");
+        }
+    } else if too_wide || too_tall {
+        said.push("the legend lists more than fits its box: its last rows or the ends of long labels are left out");
+    }
+    said
+}
+
+/// Says what a legend loses in its box, as `layout.publication` does for its own, or that it can't
+/// tell.
+fn say_legend_fit(s: &mut Session, li: usize, id: u32) {
+    let Some(l) = s.project.layouts.get(li) else { return };
+    let Some(e) = l.element(id) else { return };
+    let ElementKind::Legend { frame, title, all_classes, hide_other, exclude, columns } = &e.kind else { return };
+    let shown = match l.element(*frame).map(|f| &f.kind) {
+        Some(ElementKind::MapFrame { map, center, scale, .. }) => Some((map.clone(), *center, *scale)),
+        _ => None,
+    };
+    let (room_w, room_h) = (e.w, e.h - if title.is_empty() { 0.0 } else { crate::render::layout::legend_title_mm() });
+    let (all_classes, hide_other, exclude, columns) = (*all_classes, *hide_other, exclude.clone(), *columns);
+    let found = shown
+        .and_then(|(name, center, scale)| Some((s.project.maps.iter_mut().find(|m| m.name.eq_ignore_ascii_case(&name))?, center, scale)));
+    let Some((map, center, scale)) = found else {
+        s.warn("the legend's frame shows no map of this project, so the legend lists nothing");
+        return;
+    };
+    let at = crate::render::layout::frame_render_scale(map, center, scale);
+    let Some(sizes) = crate::render::layout::legend_sizes_mm(map, at, all_classes, hide_other, &exclude) else {
+        s.warn("a layer's source couldn't be read through, so the legend's fit in its box wasn't checked; exporting says why");
+        return;
+    };
+    let size = sizes[columns.clamp(1, MAX_LEGEND_COLUMNS) - 1];
+    for said in legend_fit_warnings(columns, size, (room_w, room_h)) {
+        s.warn(said);
+    }
+}
+
+/// The `"columns"` a legend is given, refused outside 1 to [`MAX_LEGEND_COLUMNS`].
+fn legend_columns_param(p: &Value) -> Result<Option<usize>, String> {
+    let Some(v) = p.get("columns").filter(|v| !v.is_null()) else { return Ok(None) };
+    v.as_u64()
+        .and_then(|n| usize::try_from(n).ok())
+        .filter(|n| (1..=MAX_LEGEND_COLUMNS).contains(n))
+        .map(Some)
+        .ok_or_else(|| format!("columns is a whole number from 1 to {MAX_LEGEND_COLUMNS}"))
+}
+
 fn add_element(s: &mut Session, p: &Value) -> CmdResult {
     let kind = ps(p, "kind").ok_or("kind is required")?;
     if kind != "legend" && p.get("exclude").is_some_and(|v| !v.is_null()) {
         return Err("only legends leave layers out".into());
+    }
+    if kind != "legend" && p.get("columns").is_some_and(|v| !v.is_null()) {
+        return Err(ONLY_LEGEND_COLUMNS.into());
     }
     // A family is a text's: refused elsewhere, as a legend's left-out layers are, so a script
     // doesn't take it as applied.
@@ -2246,18 +2362,6 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
     }
     let i = index(s, p)?;
     let image = if kind == "picture" { Some(super::graphics::picture(p)?) } else { None };
-    let layer_name = |s: &Session, l: &Layout, frame: u32| -> Result<String, String> {
-        let map = match l.element(frame).map(|e| &e.kind) {
-            Some(ElementKind::MapFrame { map, .. }) => map.clone(),
-            _ => return Err("no such frame".into()),
-        };
-        let m = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(&map)).ok_or_else(|| format!("no map '{map}'"))?;
-        let found = match ps(p, "layer") {
-            Some(n) => m.layer_by_name(n),
-            None => m.layers.iter().find(|l| !l.is_raster() && !l.graphics),
-        };
-        found.map(|l| l.name.clone()).ok_or_else(|| "no such layer in the frame's map".to_string())
-    };
     let l = s.project.layouts.get(i).ok_or("no layout")?;
     let (pw, ph) = (l.width, l.height);
     let (name, rect, k) = match kind {
@@ -2277,7 +2381,12 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
             let all_classes = b(p, "allClasses").unwrap_or(false);
             let hide_other = b(p, "hideOther").unwrap_or(false);
             let exclude = legend_exclude(s, l, frame, p)?.unwrap_or_default();
-            ("Legend", place(p, l, (pw - 70.0, 45.0, 60.0, 80.0))?, ElementKind::Legend { frame, title, all_classes, hide_other, exclude })
+            let columns = legend_columns_param(p)?.unwrap_or(1);
+            (
+                "Legend",
+                place(p, l, (pw - 70.0, 45.0, 60.0, 80.0))?,
+                ElementKind::Legend { frame, title, all_classes, hide_other, exclude, columns },
+            )
         }
         "colorbar" => {
             let frame = frame_of(l, p)?;
@@ -2325,14 +2434,14 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
         }
         "table" => {
             let frame = frame_of(l, p)?;
-            let layer = layer_name(s, l, frame)?;
+            let layer = frame_layer_name(s, l, frame, p)?;
             let rows = p.get("rows").and_then(Value::as_u64).unwrap_or(12).clamp(1, 500) as usize;
             ("Table Frame", place(p, l, (15.0, ph * 0.6, pw * 0.5, ph * 0.35))?, ElementKind::Table { frame, layer, rows })
         }
         "chart" => {
             let frame = frame_of(l, p)?;
-            let layer = layer_name(s, l, frame)?;
-            let m = s.project.maps.iter().find_map(|m| m.layer_by_name(&layer)).ok_or("no such layer")?;
+            let layer = frame_layer_name(s, l, frame, p)?;
+            let (_, m) = chart_field_layer(s, &layer).ok_or("no such layer")?;
             let field = match ps(p, "field") {
                 Some(fl) => m
                     .dataset
@@ -2454,6 +2563,9 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
     };
     let l = s.project.layouts.get_mut(i).ok_or("no layout")?;
     let id = l.add(name, rect, k);
+    if p.get("columns").is_some_and(|v| !v.is_null()) {
+        say_legend_fit(s, i, id);
+    }
     let mut out = json!({"element": id});
     if let Some(w) = warning {
         out["warning"] = json!(w);
@@ -2463,7 +2575,9 @@ fn add_element(s: &mut Session, p: &Value) -> CmdResult {
 
 /// The raster layer a colorbar on `frame` shows: `name` checked against the frame's map, or the
 /// map's top visible raster (`None` when the map has none yet).
-fn colorbar_layer(s: &Session, l: &Layout, frame: u32, name: Option<&str>) -> Result<Option<String>, String> {
+fn colorbar_layer(input: &impl super::InputSource, l: &Layout, frame: u32, name: Option<&str>) -> Result<Option<String>, String> {
+    let context = input.input_context();
+    let s = &context;
     let map = match l.element(frame).map(|e| &e.kind) {
         Some(ElementKind::MapFrame { map, .. }) => map.clone(),
         _ => return Err("no such frame".into()),
@@ -2763,7 +2877,9 @@ fn font_warning(font: FontFamily, name: Option<&str>, fallback_given: bool, styl
 
 /// A legend's `exclude` from `p`: the names of layers in its frame's map, as the map spells them;
 /// `None` when not given. Not a list of names, or a name the map hasn't, is an error.
-fn legend_exclude(s: &Session, l: &Layout, frame: u32, p: &Value) -> Result<Option<Vec<String>>, String> {
+fn legend_exclude(input: &impl super::InputSource, l: &Layout, frame: u32, p: &Value) -> Result<Option<Vec<String>>, String> {
+    let context = input.input_context();
+    let s = &context;
     let Some(v) = p.get("exclude").filter(|v| !v.is_null()) else { return Ok(None) };
     let names = v.as_array().ok_or("exclude is a list of layer names")?;
     if names.len() > rustgis_map::layout::MAX_LEGEND_EXCLUDED {
@@ -2886,50 +3002,7 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
         unlocked(s.project.layouts.get(li).ok_or("no layout")?, id)?;
     }
     // A new layer (tables and charts) or field (charts) must exist in the frame's map.
-    let checked = {
-        let l = s.project.layouts.get(li).ok_or("no layout")?;
-        let e = l.element(id).ok_or_else(|| format!("no element {id}"))?;
-        match (&e.kind, ps(p, "layer"), ps(p, "field")) {
-            (ElementKind::Table { frame, layer, .. } | ElementKind::Chart { frame, layer, .. }, nl, nf) if nl.is_some() || nf.is_some() => {
-                let map = match l.element(*frame).map(|f| &f.kind) {
-                    Some(ElementKind::MapFrame { map, .. }) => map.clone(),
-                    _ => return Err("the element's map frame is gone".into()),
-                };
-                let m = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(&map)).ok_or_else(|| format!("no map '{map}'"))?;
-                let target = m
-                    .layer_by_name(nl.unwrap_or(layer))
-                    .filter(|l| !l.is_raster())
-                    .ok_or_else(|| format!("no feature layer '{}' in {map}", nl.unwrap_or(layer)))?;
-                // Only charts have a field.
-                let field = match nf.filter(|_| matches!(e.kind, ElementKind::Chart { .. })) {
-                    Some(fl) => Some(
-                        target
-                            .dataset
-                            .field_index(fl)
-                            .and_then(|i| target.dataset.fields.get(i))
-                            .filter(|f| f.ty.is_numeric())
-                            .map(|f| f.name.clone())
-                            .ok_or_else(|| format!("no numeric field '{fl}' in {}", target.name))?,
-                    ),
-                    // A chart moved to another layer keeps its field only if that layer has it as a
-                    // number; otherwise it charts the layer's first numeric field.
-                    None => match &e.kind {
-                        ElementKind::Chart { field, .. } if nl.is_some() => {
-                            let numeric = |f: &&rustgis_data::Field| f.ty.is_numeric();
-                            let keep = target.dataset.field_index(field).and_then(|i| target.dataset.fields.get(i)).filter(numeric);
-                            let f = keep
-                                .or_else(|| target.dataset.fields.iter().find(numeric))
-                                .ok_or_else(|| format!("{} has no numeric field to chart", target.name))?;
-                            Some(f.name.clone())
-                        }
-                        _ => None,
-                    },
-                };
-                Some((target.name.clone(), field))
-            }
-            _ => None,
-        }
-    };
+    let checked = checked_update(s, p, li, id)?;
     // A colorbar's new layer must be a raster in its frame's map; empty follows the top raster.
     let colorbar = {
         let l = s.project.layouts.get(li).ok_or("no layout")?;
@@ -3075,6 +3148,12 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
             _ => None,
         }
     };
+    let new_columns = legend_columns_param(p)?;
+    if new_columns.is_some()
+        && !matches!(s.project.layouts.get(li).and_then(|l| l.element(id)).map(|e| &e.kind), Some(ElementKind::Legend { .. }))
+    {
+        return Err(ONLY_LEGEND_COLUMNS.into());
+    }
     let l = active(s, p)?;
     let e = l.element_mut(id).ok_or_else(|| format!("no element {id}"))?;
     let num = |k: &str, lo: f64, hi: f64| f(p, k).map(|v| v.clamp(lo, hi));
@@ -3135,9 +3214,12 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
                 *bold = v;
             }
         }
-        ElementKind::Legend { title, all_classes, hide_other, exclude, .. } => {
+        ElementKind::Legend { title, all_classes, hide_other, exclude, columns, .. } => {
             if let Some(names) = new_exclude {
                 *exclude = names;
+            }
+            if let Some(n) = new_columns {
+                *columns = n;
             }
             if let Some(t) = ps(p, "title") {
                 *title = t.chars().take(200).collect();
@@ -3214,6 +3296,17 @@ fn update(s: &mut Session, p: &Value) -> CmdResult {
         }
         _ => {}
     }
+    // A legend in columns is told again when its box or what it lists changes; a move changes neither.
+    let in_columns = matches!(&e.kind, ElementKind::Legend { columns, .. } if *columns > 1);
+    let refitted = f(p, "w").is_some()
+        || f(p, "h").is_some()
+        || ps(p, "title").is_some()
+        || b(p, "allClasses").is_some()
+        || b(p, "hideOther").is_some()
+        || p.get("exclude").is_some_and(|v| !v.is_null());
+    if new_columns.is_some() || (in_columns && refitted) {
+        say_legend_fit(s, li, id);
+    }
     if let Some(w) = font_told {
         return Ok(json!({"warning": w}));
     }
@@ -3240,16 +3333,9 @@ fn set_frame(s: &mut Session, li: usize, frame: u32, e: &Extent) -> Result<(), S
 fn frame_zoom(s: &mut Session, p: &Value) -> CmdResult {
     let li = index(s, p)?;
     let l = s.project.layouts.get(li).ok_or("no layout")?;
-    let frame = match p.get("element") {
-        Some(_) => frame_of(l, &json!({"frame": p.get("element")}))?,
-        None => frame_of(l, p)?,
-    };
+    let frame = zoom_frame(l, p)?;
     unlocked(l, frame)?;
-    let map = match l.element(frame).map(|e| &e.kind) {
-        Some(ElementKind::MapFrame { map, .. }) => map.clone(),
-        _ => return Err("no such frame".into()),
-    };
-    let m = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(&map)).ok_or_else(|| format!("no map '{map}'"))?;
+    let m = frame_map(s, l, frame)?;
     match ps(p, "to").unwrap_or("view") {
         "view" => {
             let w = l.element(frame).map(|e| e.w).unwrap_or(100.0);
@@ -3300,7 +3386,7 @@ fn series(s: &mut Session, p: &Value) -> CmdResult {
         _ => return Err("no such frame".into()),
     };
     let n = ps(p, "layer").ok_or("layer is required")?;
-    let m = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(&map)).ok_or_else(|| format!("no map '{map}'"))?;
+    let m = frame_map(s, l, frame)?;
     let layer = m.layer_by_name(n).filter(|l| !l.is_raster()).ok_or_else(|| format!("no feature layer '{n}' in {map}"))?;
     if layer.dataset.features.is_empty() {
         return Err("the index layer has no features".into());
@@ -3336,7 +3422,9 @@ pub fn series_info(s: &Session, li: usize, page: usize) -> Option<(usize, String
 }
 
 /// A map series' index layer and its name field.
-fn series_layer(s: &Session, li: usize) -> Option<(&rustgis_map::Layer, Option<usize>)> {
+fn series_layer(input: &impl super::InputSource, li: usize) -> Option<(&rustgis_map::Layer, Option<usize>)> {
+    let context = input.input_context();
+    let s = &context;
     let l = s.project.layouts.get(li)?;
     let sr = l.series.as_ref()?;
     let map = match l.element(sr.frame).map(|e| &e.kind) {
@@ -3613,4 +3701,363 @@ pub(crate) fn import(s: &mut Session, text: &str) -> CmdResult {
     let i = s.project.layouts.len() - 1;
     s.active_layout = Some(i);
     Ok(json!({"layout": i, "name": name}))
+}
+
+/// Selects the explicit or first feature layer in the stored frame's map.
+fn frame_layer_name(input: &impl super::InputSource, l: &Layout, frame: u32, p: &Value) -> Result<String, String> {
+    let context = input.input_context();
+    let s = &context;
+    let map = match l.element(frame).map(|e| &e.kind) {
+        Some(ElementKind::MapFrame { map, .. }) => map.clone(),
+        _ => return Err("no such frame".into()),
+    };
+    let m = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(&map)).ok_or_else(|| format!("no map '{map}'"))?;
+    let found = match ps(p, "layer") {
+        Some(n) => m.layer_by_name(n),
+        None => m.layers.iter().find(|l| !l.is_raster() && !l.graphics),
+    };
+    found.map(|l| l.name.clone()).ok_or_else(|| "no such layer in the frame's map".to_string())
+}
+
+/// Resolves a frame's stored map literally; missing frame maps are errors here.
+fn frame_map<'a>(input: &'a impl super::InputSource, l: &Layout, frame: u32) -> Result<&'a rustgis_map::Map, String> {
+    let context = input.input_context();
+    let s = &context;
+    let map = match l.element(frame).map(|e| &e.kind) {
+        Some(ElementKind::MapFrame { map, .. }) => map,
+        _ => return Err("no such frame".into()),
+    };
+    s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(map)).ok_or_else(|| format!("no map '{map}'"))
+}
+/// Binds the chosen frame map and the layers whose extent this zoom consumes.
+fn frame_zoom_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    let s = input;
+    let layout = s.project.layouts.get(index(input, p)?).ok_or("no layout")?;
+    let frame = zoom_frame(layout, p)?;
+    let map = frame_map(input, layout, frame)?;
+    let mut inputs = match ps(p, "to").unwrap_or("view") {
+        "layer" => super::Inputs::named(map, [ps(p, "layer").ok_or("layer is required")?])?,
+        "full" | "selection" => super::Inputs::layers(map.layers.iter().map(|l| (map, l))),
+        _ => super::Inputs::layers(std::iter::empty()),
+    };
+    inputs.maps.push(map.instance_id());
+    inputs.state = json!({"layout":index(input,p)?,"frame":frame});
+    Ok(inputs)
+}
+/// Binds a new series to its actual frame map, unless the call only turns it off.
+fn series_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    let s = input;
+    if b(p, "off") == Some(true) {
+        return Ok(super::Inputs::layers(std::iter::empty()));
+    }
+    let layout = s.project.layouts.get(index(input, p)?).ok_or("no layout")?;
+    let frame = frame_of(layout, p)?;
+    let map = frame_map(input, layout, frame)?;
+    let mut inputs = super::Inputs::named(map, [ps(p, "layer").ok_or("layer is required")?])?;
+    inputs.maps.push(map.instance_id());
+    inputs.state = json!({"layout":index(input,p)?,"frame":frame});
+    Ok(inputs)
+}
+/// Binds the stored series frame/layer before changing its current page.
+fn series_page_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    let s = input;
+    let li = index(input, p)?;
+    let (layer, _) = series_layer(input, li).ok_or("the layout has no map series")?;
+    let mut inputs =
+        super::Inputs::layers(s.project.maps.iter().flat_map(|m| m.layers.iter().filter(|l| std::ptr::eq(*l, layer)).map(move |l| (m, l))));
+    inputs.state = json!({"layout":li,"series":s.project.layouts.get(li).and_then(|l|l.series.as_ref())});
+    Ok(inputs)
+}
+/// Collects only the selectors the requested surround validates, including chart field precedence.
+fn element_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    let s = input;
+    let kind = ps(p, "kind").ok_or("kind is required")?;
+    if !matches!(kind, "table" | "chart" | "colorbar" | "legend") {
+        let mut inputs = object_inputs(input, p)?;
+        if matches!(kind, "northArrow" | "scaleBar" | "extentIndicator" | "grid") {
+            let layout = s.project.layouts.get(index(input, p)?).ok_or("no layout")?;
+            inputs.state["frame"] = json!(frame_of(layout, p)?);
+        }
+        return Ok(inputs);
+    }
+    let layout = s.project.layouts.get(index(input, p)?).ok_or("no layout")?;
+    let frame = frame_of(layout, p)?;
+    if kind == "legend" && legend_exclude(input, layout, frame, p)?.is_none() {
+        let mut inputs = object_inputs(input, p)?;
+        inputs.state["frame"] = json!(frame);
+        return Ok(inputs);
+    }
+    let map = frame_map(input, layout, frame)?;
+    let mut inputs = super::Inputs::layers(std::iter::empty());
+    if matches!(kind, "table" | "chart") {
+        let name = frame_layer_name(input, layout, frame, p)?;
+        inputs.extend(super::Inputs::named(map, [name.as_str()])?);
+        if kind == "chart"
+            && let Some((m, l)) = chart_field_layer(input, &name)
+        {
+            inputs.layers.push((m.instance_id(), l.id));
+        }
+    } else if kind == "colorbar" {
+        if let Some(name) = colorbar_layer(input, layout, frame, ps(p, "layer"))? {
+            inputs.extend(super::Inputs::named(map, [name.as_str()])?);
+        }
+    } else if let Some(names) = legend_exclude(input, layout, frame, p)? {
+        inputs.layers.extend(names.iter().filter_map(|name| map.layer_by_name(name)).map(|l| (map.instance_id(), l.id)));
+        // Tile exclusions are stored selector text, not invented layer/table identities.
+        inputs.state = json!(names);
+    }
+    inputs.maps.push(map.instance_id());
+    inputs.state = json!({"layout":index(input,p)?,"frame":frame,"selectors":inputs.state});
+    Ok(inputs)
+}
+/// Resolves the same active/name/index layout used by export before its dependency walk.
+fn layout_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    Ok(render_inputs_at(input, index(input, p)?))
+}
+/// Collects only maps actually referenced by renderer frames; never renders or opens a source.
+pub(crate) fn render_inputs_at(input: &impl super::InputSource, li: usize) -> super::Inputs {
+    let context = input.input_context();
+    let s = &context;
+    let Some(layout) = s.project.layouts.get(li) else { return super::Inputs::unresolved() };
+    let mut inputs = super::Inputs::layers(std::iter::empty());
+    for element in &layout.elements {
+        // A missing stored map renders a placeholder, and consumes no map/layer source.
+        if let ElementKind::MapFrame { map, .. } = &element.kind
+            && let Some(map) = rustgis_render::layout::map_index(&s.project.maps, map).and_then(|i| s.project.maps.get(i))
+        {
+            inputs.extend(super::tiles::render_inputs(map));
+        }
+    }
+    inputs.state = json!({"layout":li,"name":layout.name,"selectors":layout.elements.iter().filter_map(|e| element_selectors(&e.kind).map(|v|(e.id,v))).collect::<Vec<_>>(),"series":layout.series,"tiles":inputs.state});
+    inputs
+}
+
+/// Charts find fields in the first matching project layer, separately from the frame's layer.
+fn chart_field_layer<'a>(input: &'a impl super::InputSource, name: &str) -> Option<(&'a rustgis_map::Map, &'a rustgis_map::Layer)> {
+    let context = input.input_context();
+    let s = &context;
+    s.project.maps.iter().find_map(|map| map.layer_by_name(name).map(|layer| (map, layer)))
+}
+
+/// Finds only the generated, unreferenced globe map that publication may replace.
+fn locator_orphan(input: &impl super::InputSource) -> Option<usize> {
+    let context = input.input_context();
+    let s = &context;
+    let src = s.map();
+    let base = format!("{} Locator", src.name);
+    let shown = |n: &str| {
+        s.project
+            .layouts
+            .iter()
+            .flat_map(|l| &l.elements)
+            .any(|e| matches!(&e.kind, ElementKind::MapFrame { map, .. } if map.eq_ignore_ascii_case(n)))
+    };
+    let ours = |n: &str| {
+        n.strip_prefix(base.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.strip_prefix(' ').is_some_and(|k| k.parse::<u32>().is_ok()))
+    };
+    // And made as this command makes them: no web tiles, only unlabelled polygon layers,
+    // so a globe map made by hand under that name is left alone.
+    let made_here = |x: &rustgis_map::Map| {
+        x.tiles.is_empty() && x.layers.iter().all(|l| l.geometry_type() == rustgis_data::GeometryType::Polygon && !l.labels.enabled)
+    };
+    s.project.maps.iter().position(|x| x.projection.is_globe() && ours(&x.name) && !shown(&x.name) && x.name != src.name && made_here(x))
+}
+
+/// Parses the publication's locator choice with the sheet-specific default.
+fn publication_locator(p: &Value, sheet: bool) -> Result<Locator, String> {
+    Ok(match p.get("locator").filter(|v| !v.is_null()) {
+        None => {
+            if sheet {
+                Locator::Globe
+            } else {
+                Locator::None
+            }
+        }
+        Some(v) => match v.as_str().map(str::trim) {
+            Some("globe") => Locator::Globe,
+            Some("inset") => Locator::Inset,
+            Some("none") => Locator::None,
+            _ => return Err("locator is \"globe\", \"inset\" or \"none\"".into()),
+        },
+    })
+}
+
+/// Binds the active shown inputs and the optional generated map replacement.
+fn publication_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    let s = input;
+    let (_, profile) = publication_profile(p)?;
+    let locator = publication_locator(p, profile.sheet)?;
+    let map = s.map();
+    let mut inputs = super::Inputs::layers(map.layers.iter().filter(|l| map.shows(l)).map(|l| (map, l)));
+    inputs.maps.push(map.instance_id());
+    if matches!(locator, Locator::Globe) {
+        if let Some(old) = locator_orphan(input).and_then(|i| s.project.maps.get(i)) {
+            inputs.maps.push(old.instance_id());
+            inputs.layers.extend(old.layers.iter().map(|l| (old.instance_id(), l.id)));
+        } else {
+            inputs.state = json!({"locator":"new map"});
+        }
+    }
+    Ok(inputs)
+}
+
+/// Resolves the profile and automatic sheet orientation without laying out or rendering.
+fn publication_profile(p: &Value) -> Result<(Option<String>, &'static PublicationProfile), String> {
+    let id = match p.get("profile").filter(|v| !v.is_null()) {
+        None => "a4".to_string(),
+        Some(v) => v.as_str().map(|t| t.trim().to_ascii_lowercase()).ok_or("profile is a profile's name, such as \"a4-portrait\"")?,
+    };
+    // A sheet's size alone ("a4", the default): its orientation chosen below, from the area's
+    // shape, portrait until then.
+    let auto = matches!(id.as_str(), "a4" | "a3" | "a2").then(|| id.clone());
+    let id = match &auto {
+        Some(size) => format!("{size}-portrait"),
+        None => id,
+    };
+    let profile = PUBLICATION_PROFILES.iter().find(|pr| pr.id == id).ok_or_else(|| {
+        let names: Vec<&str> = PUBLICATION_PROFILES.iter().map(|pr| pr.id).collect();
+        format!("unknown profile '{id}': a4, a3 or a2 (turned to the area's shape), {}", names.join(", "))
+    })?;
+    Ok((auto, profile))
+}
+
+/// Validates a table/chart's effective layer and field before mutation; input binding uses this same choice.
+fn checked_update(input: &impl super::InputSource, p: &Value, li: usize, id: u32) -> Result<Option<(String, Option<String>)>, String> {
+    let context = input.input_context();
+    let s = &context;
+    Ok({
+        let l = s.project.layouts.get(li).ok_or("no layout")?;
+        let e = l.element(id).ok_or_else(|| format!("no element {id}"))?;
+        match (&e.kind, ps(p, "layer"), ps(p, "field")) {
+            (ElementKind::Table { frame, layer, .. } | ElementKind::Chart { frame, layer, .. }, nl, nf) if nl.is_some() || nf.is_some() => {
+                let map = match l.element(*frame).map(|f| &f.kind) {
+                    Some(ElementKind::MapFrame { map, .. }) => map.clone(),
+                    _ => return Err("the element's map frame is gone".into()),
+                };
+                let m = s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(&map)).ok_or_else(|| format!("no map '{map}'"))?;
+                let target = m
+                    .layer_by_name(nl.unwrap_or(layer))
+                    .filter(|l| !l.is_raster())
+                    .ok_or_else(|| format!("no feature layer '{}' in {map}", nl.unwrap_or(layer)))?;
+                // Only charts have a field.
+                let field = match nf.filter(|_| matches!(e.kind, ElementKind::Chart { .. })) {
+                    Some(fl) => Some(
+                        target
+                            .dataset
+                            .field_index(fl)
+                            .and_then(|i| target.dataset.fields.get(i))
+                            .filter(|f| f.ty.is_numeric())
+                            .map(|f| f.name.clone())
+                            .ok_or_else(|| format!("no numeric field '{fl}' in {}", target.name))?,
+                    ),
+                    // A chart moved to another layer keeps its field only if that layer has it as a
+                    // number; otherwise it charts the layer's first numeric field.
+                    None => match &e.kind {
+                        ElementKind::Chart { field, .. } if nl.is_some() => {
+                            let numeric = |f: &&rustgis_data::Field| f.ty.is_numeric();
+                            let keep = target.dataset.field_index(field).and_then(|i| target.dataset.fields.get(i)).filter(numeric);
+                            let f = keep
+                                .or_else(|| target.dataset.fields.iter().find(numeric))
+                                .ok_or_else(|| format!("{} has no numeric field to chart", target.name))?;
+                            Some(f.name.clone())
+                        }
+                        _ => None,
+                    },
+                };
+                Some((target.name.clone(), field))
+            }
+            _ => None,
+        }
+    })
+}
+
+/// An element key overrides frame even when null, using frame_of's existing fallback semantics.
+fn zoom_frame(l: &Layout, p: &Value) -> Result<u32, String> {
+    match p.get("element") {
+        Some(_) => frame_of(l, &json!({"frame":p.get("element")})),
+        None => frame_of(l, p),
+    }
+}
+/// String names select another map; other values retain the active-map convention.
+fn added_frame_map<'a>(input: &'a impl super::InputSource, p: &Value) -> Result<&'a rustgis_map::Map, String> {
+    let context = input.input_context();
+    let s = &context;
+    match ps(p, "map") {
+        Some(n) => s.project.maps.iter().find(|m| m.name.eq_ignore_ascii_case(n)).ok_or_else(|| format!("no map '{n}'")),
+        None => Ok(s.map()),
+    }
+}
+/// Records the map whose current view initializes the new frame.
+fn add_frame_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    let mut inputs = object_inputs(input, p)?;
+    inputs.maps.push(added_frame_map(input, p)?.instance_id());
+    Ok(inputs)
+}
+/// Records only stored references actually validated by this element update.
+fn update_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    let s = input;
+    let li = index(input, p)?;
+    let id = element_id(p)?;
+    let l = s.project.layouts.get(li).ok_or("no layout")?;
+    let mut inputs = super::Inputs::layers(std::iter::empty());
+    if let Some((name, _)) = checked_update(input, p, li, id)? {
+        let frame = match l.element(id).map(|e| &e.kind) {
+            Some(ElementKind::Table { frame, .. } | ElementKind::Chart { frame, .. }) => *frame,
+            _ => return Ok(inputs),
+        };
+        inputs.extend(super::Inputs::named(frame_map(input, l, frame)?, [name.as_str()])?);
+    }
+    match l.element(id).map(|e| &e.kind) {
+        Some(ElementKind::MapFrame { .. }) if ps(p, "map").is_some() => inputs.maps.push(added_frame_map(input, p)?.instance_id()),
+        Some(ElementKind::Colorbar { frame, .. }) if ps(p, "layer").is_some_and(|n| !n.trim().is_empty()) => {
+            if let Some(name) = colorbar_layer(input, l, *frame, ps(p, "layer"))? {
+                inputs.extend(super::Inputs::named(frame_map(input, l, *frame)?, [name.as_str()])?);
+            }
+        }
+        Some(ElementKind::Legend { frame, .. }) => {
+            if let Some(names) = legend_exclude(input, l, *frame, p)? {
+                let map = frame_map(input, l, *frame)?;
+                inputs.layers.extend(names.iter().filter_map(|n| map.layer_by_name(n)).map(|l| (map.instance_id(), l.id)));
+                inputs.state = json!(names);
+            }
+        }
+        _ => {}
+    }
+    inputs.state = json!({"layout":li,"element":id,"kind":l.element(id).map(|e|e.kind.code()),"stored":l.element(id).and_then(|e|element_selectors(&e.kind)),"selectors":inputs.state});
+    Ok(inputs)
+}
+
+/// Reference-only operations bind the actual chosen layout, without reading its stored maps.
+fn object_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    let s = input;
+    let i = index(input, p)?;
+    let layout = s.project.layouts.get(i).ok_or("no layout")?;
+    let mut inputs = super::Inputs::layers(std::iter::empty());
+    inputs.state = json!({"layout":i,"name":layout.name});
+    Ok(inputs)
+}
+/// Browser name-based actions use their existing name-to-layout parameter projection.
+fn named_object_inputs(input: &super::InputContext<'_>, p: &Value) -> Result<super::Inputs, String> {
+    object_inputs(input, &by_name(p))
+}
+/// Closing the layout view succeeds even when none is open.
+fn close_inputs(input: &super::InputContext<'_>, _: &Value) -> Result<super::Inputs, String> {
+    let s = input;
+    let mut inputs = super::Inputs::layers(std::iter::empty());
+    inputs.state = json!({"activeLayout":s.active_layout});
+    Ok(inputs)
+}
+
+/// Stored surround references consumed by rendering or validation, kept as private selector text.
+fn element_selectors(kind: &ElementKind) -> Option<Value> {
+    Some(match kind {
+        ElementKind::MapFrame { map, extent_of, .. } => json!({"map":map,"extentOf":extent_of}),
+        ElementKind::Table { frame, layer, .. } => json!({"frame":frame,"layer":layer}),
+        ElementKind::Chart { frame, layer, field, label } => json!({"frame":frame,"layer":layer,"field":field,"label":label}),
+        ElementKind::Legend { frame, exclude, .. } => json!({"frame":frame,"exclude":exclude}),
+        ElementKind::Colorbar { frame, layer, .. } => json!({"frame":frame,"layer":layer}),
+        ElementKind::NorthArrow { frame, .. } | ElementKind::ScaleBar { frame, .. } => json!({"frame":frame}),
+        _ => return None,
+    })
 }

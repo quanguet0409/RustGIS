@@ -29,7 +29,7 @@ not every EPSG code; azimuthal equidistant systems such as Equi7 need the deskto
 | OpenStreetMap PBF | `.osm.pbf`, or `.pbf` containing OSM data | Add Data, drop the file, or upload | Points (tagged nodes), lines and multipolygons (closed ways that are areas, and multipolygon and boundary relations), with common tags as fields and the rest in `other_tags`, as GDAL gives them. Up to 40 million nodes (4 million in the web app); on the desktop, extracts over 256 MiB open through GDAL when it is installed. Vector-tile `.pbf` files use Add Tile Layer instead. |
 | ArcGIS feature-service answers (protocol buffer) | `.pbf` holding an answer to an ArcGIS query with `f=pbf`, or the query's address | Add Data, drop the file, upload, or From URL… with the query's address (`…/FeatureServer/0/query?…&f=pbf`) | One page of the layer: the fields and values the same query gives as GeoJSON, with the fields' aliases as their display names (dates as milliseconds since 1970, date-only and time values as text), points, lines or polygons converted to longitude/latitude from the answer's coordinate system. Z and M values, geometry, blob and raster fields are left out, with a notice. A page that stopped at the service's record limit keeps its features, with a notice that the rest aren't in it. A query the service refuses (an empty answer), a count, ids or an extent, curves, multipatches and envelopes give an error. Told from OpenStreetMap data by its content. |
 | TopoJSON | `.topojson`, or `.json` | Add Data, drop the file, or upload | Shared arcs (quantized or not) are rebuilt into geometries. A `.topojson` adds a layer per object, up to 64; a topology named `.json` adds its first object and names the others in a notice. Use `.topojson` to add them all. |
-| CityJSON | `.city.json`, or `.json` | Add Data, drop the file, upload, or From URL… | CityJSON 1.1 and 2.0, read in 2D: a layer per City Object type and geometry family (a name two layers would share, such as two long types cut to their first 64 characters, or two that differ only in ASCII case, gets ` (2)`, ` (3)`… on the later ones: the first number no other layer's name uses). Surfaces and solids become footprints (LoD 0, else the `GroundSurface` surfaces, else the union of the faces of the highest LoD, else the outline of the points; a geometry of more than 200,000 faces is the outline of its points (of its ground's, for a footprint from the ground), with a notice, unless its footprint is its ground and all of its ground faces are within the cap), with `z_min`, `z_max` and `height` fields, from every level of detail and the children's heights included, so Style › Extrusion stands them up. Also `id`, `type`, `parent`, `lod` and the object's attributes. A `.city.json`, or a model from an address, adds every layer, up to 64; a file named `.json` adds its first layer with something to draw and names the others in a notice. A file that names no coordinate system and isn't longitude/latitude is refused: for now the way to add it is the `"crs"` parameter of `layer.addData`, from the command line, Python or the AI Assistant. Geometry instances are drawn as a point at their reference point, with no height, and `TINRelief` objects aren't drawn; a notice says so, as it does for addresses. Appearance (materials and textures) isn't read, and a notice says how much is left out. Heights are kept in the file's unit: in a coordinate system that doesn't measure in metres, a notice says so, as Style › Extrusion reads metres. In a zip, a `"crs"` applies only to a model that names no coordinate system RustGIS knows. In the browser a footprint that needs a union is the outline of the object's points; a notice says so. Extrusions have no base height yet, so a part above the ground stands on the ground. |
+| CityJSON | `.city.json`, or `.json` | Add Data, drop the file, upload, or From URL… | CityJSON 1.1 and 2.0, read in 2D: a layer per City Object type and geometry family (a name two layers would share, such as two long types cut to their first 64 characters, or two that differ only in ASCII case, gets ` (2)`, ` (3)`… on the later ones: the first number no other layer's name uses). Surfaces and solids become footprints (LoD 0, else the `GroundSurface` surfaces, else the union of the faces of the highest LoD, each tried when the one before gives no area, else the outline of the points; lines and points come from their highest level of detail that draws; a level passed over because its X or Y isn't a finite number, or is too large, is named in a notice; a geometry of more than 200,000 faces is the outline of its points (of its ground's, for a footprint from the ground), with a notice, unless its footprint is its ground and all of its ground faces are within the cap), with `z_min`, `z_max` and `height` fields, from every level of detail and the children's heights included, so Style › Extrusion stands them up. Also `id`, `type`, `parent`, `lod` and the object's attributes; one named as one of these fields, or as another attribute of its layer but for case, takes a number (`height_1`), the same in every row, and a notice lists them. A `.city.json`, or a model from an address, adds every layer, up to 64; a file named `.json` adds its first layer with something to draw and names the others in a notice. A file that names no coordinate system and isn't longitude/latitude is refused: for now the way to add it is the `"crs"` parameter of `layer.addData`, from the command line, Python or the AI Assistant. Geometry instances are drawn as a point at their reference point, with no height, and `TINRelief` objects aren't drawn; a notice says so, as it does for addresses. Appearance (materials and textures) isn't read, and a notice says how much is left out. Heights are kept in the file's unit: in a coordinate system that doesn't measure in metres, a notice says so, as Style › Extrusion reads metres. In a zip, a `"crs"` applies only to a model that names no coordinate system RustGIS knows. In the browser a footprint that needs a union is the outline of the object's points; a notice says so. Extrusions have no base height yet, so a part above the ground stands on the ground. |
 | AutoCAD DXF | `.dxf` (ASCII) | Add Data, drop the file, or upload | Points, lines and polygons layers from the drawing's entities: POINT, LINE, LWPOLYLINE and POLYLINE (bulges drawn as arcs; closed ones stay lines; polyface meshes become polygons), CIRCLE, ARC, ELLIPSE, SPLINE, HELIX, LEADER, MLINE (its centre line), TEXT, MTEXT, ATTRIB and constant ATTDEF (points with their text, at the alignment point of justified text), HATCH boundaries (holes found by nesting), SOLID, TRACE and 3DFACE (polygons). Blocks (named in any case) are drawn where INSERTs place them (scaled, rotated, in arrays, nested up to 8 deep), and so are DIMENSIONs' blocks (a linear dimension without one draws its lines and measured text). Entities in an object's own coordinate system are turned into the drawing's. Fields: `layer`, `entity`, `color` (ACI, BYLAYER and BYBLOCK resolved), `linetype`, `text`, `height`, `rotation`, `block`, `elevation` and `paperspace`. The drawing's layouts (paper space: title blocks, viewport frames) are left out, with a notice, unless `"paperSpace": true`. A drawing never says its coordinate system: give `"crs"` (such as `EPSG:2263`), or its coordinates are kept as they are, with a notice. `"layer"` picks one of the drawing's own layers, and `info.fileLayers` lists them. Up to 2 million features (500,000 in the web app). Not read: binary DXF, MULTILEADER, WIPEOUT, IMAGE and ACIS solids (3DSOLID, REGION), named in a notice. |
 | Geotagged photos | `.jpg`, `.jpeg` | Add Data (several at once in the web app), drop them, upload, or `layer.addPhotos` with `"paths"` or a `"folder"` | JPEGs with a GPS position in their EXIF become points in the **Photos** layer (photos added one at a time join it): each with its `name`, `file`, `time` (when it was taken), `altitude`, `direction` (where the camera faced), `camera` and a `thumbnail` of at most 160 pixels, kept with the feature so the project needs no other file. Identify shows the thumbnail. Photos without a position are named in a notice and left out; a layer holds up to 2,000 photos. A JPEG is always read as a photo unless `layer.addData` or `layer.addDataBytes` is given `"as": "scan"` (a phone photo of a paper map, say: see [Scans with no coordinates](#rasters)). |
 | LiDAR point clouds | `.las`, `.laz` (COPC too) | Add Data, drop the file, upload, or From URL… | LAS 1.0–1.4 (point formats 0–10) and LAZ, on desktop and web: points with `z`, `intensity`, `classification`, `return` and colour (`red`, `green`, `blue`), coloured by ASPRS class or elevation. An evenly spread sample is read once, at most 2 million points (500,000 in the web app); views use that sample, not the COPC spatial index. LAZ decompression reads at most the first 400 million points (40 million on the web), with a notice when capped. Converted from the file's WKT or GeoTIFF-key record; without one, coordinates are kept with a notice. A local project keeps the path; uploads keep the file bytes. Remote files download whole. |
@@ -111,16 +111,57 @@ unresponsive. The original JPEG 2000 byte buffer is released once it has been st
 before GDAL runs or the GeoTIFF is read back. The converted GeoTIFF and decoded raster still
 occupy memory together; the 512 MiB file limit is not a limit on total process memory.
 
-A tiled GeoTIFF is read in place rather than downloaded: its header first, then, by HTTP range
-requests, the tiles of the overview each part of the view needs. Overviews make zoomed-out reads
-smaller. It is a tile layer (`map.addTiles` kind `cog`, saved by its address), drawn under the map's
-own layers: RGB(A) 8-bit images in colour, other images stretched between the 2nd and 98th
-percentiles of their coarsest overview. Planar files (bands stored apart), signed-byte data and
-bottom-up images work too. `map.setTiles` selects one or three `"bands"` (from 1) and a fixed
-`"range"`; see [Satellite embeddings](web-data.md#satellite-embeddings).
-A GeoTIFF in strips, a rotated image or an unsupported tiled image downloads whole as a raster layer, as does a
-GeoTIFF added with `"whole": true` (for raster tools and symbology). The web app needs the server
-to allow range requests (CORS with the `Range` header).
+A tiled GeoTIFF (a cloud-optimised one) is read in place rather than downloaded: its header
+first, then, by HTTP range requests, only the parts the map needs. It is a raster layer like a
+GeoTIFF file, saved by its address: the Symbology pane, the raster commands (`raster.symbology`,
+`raster.bands`, `raster.stretch`, `raster.dra`, `raster.enhance`, `raster.mask`…), its legend,
+identify and the raster tools work on it as on a file's. The layer holds an overview of the image
+(every band, about two million values), from which its statistics, histograms and tools read, as a
+file too large to hold whole is opened from an overview; zoomed in past it, the map reads the part
+in view at the resolution it needs as it draws, and draws it with the layer's style and the
+overview's statistics, so the image looks the same at every zoom. Until a part's tiles arrive, the
+level zoomed from stands in for them. A turned layer (Rotation in the Symbology pane) is drawn
+from the overview it holds: zoomed in past it, the map says so and an export refuses it. The
+Details pane says the image's full size and that it is read in place. The desktop app adds the
+layer at once and reads its overview as the map draws (the Details pane says so until it is in),
+so a slow host doesn't hold the window; the command line and Python wait for it, up to two
+minutes, so a command's result is complete. A saved S3 connection chosen for such layers (Choose
+S3 connection…) counts them as still being read until their overview is in, apart from what it
+opened. A file whose smallest image is too large to hold as the overview (a large image saved
+without overviews) is refused where the session waits for it (the command line, Python); the desktop
+app and the browser add the layer, which says why it can't be read. GDAL's COG driver or `gdaladdo`
+makes the overviews. A tile a sparse file leaves out is empty. A tile, the file's header or the
+overview a layer holds, that fails to arrive is asked for again a minute later, or when its server
+says to in a `Retry-After` header (with a 429 or 503 answer, within the hour); the map draws again
+then. An overview that fails again waits twice as long each time, up to an hour. On the command
+line and in Python, which don't draw, the next command run once the wait is over reads a failed
+overview again, waiting for it as the project did.
+Exporting the layer (Raster to PMTiles) waits for its tiles on the desktop, up to two minutes,
+and isn't written without them; the web app can't wait, so an export whose tiles aren't all in
+says so and asks for the rest: export again once they are in (a large archive may take a few
+tries).
+
+Its first look is what the file's PhotometricInterpretation tag says:
+
+- **RGB:** red, green and blue, with the alpha band if there is one. Bands past the colour ones
+  (an RGB and near-infrared orthophoto, say) are read too.
+- **Palette:** its colour table (Colormap).
+- **Grey (MinIsBlack, as most remote sensing images are):** the first band stretched in grey, or
+  three bands as red, green and blue. An alpha band is shown with it.
+
+In an image with more bands (an 8-band multispectral image, say) you pick the combination in the
+Symbology pane, as for any raster. GeoTIFF files follow the same rule and have every band too (an
+RGB and near-infrared file has four), and so do other rasters without colours of their own (Zarr
+stores, files read through GDAL): four or more bands open as the first in grey, where any three
+or more used to open as red, green and blue. A palette image without its colour table is drawn in
+grey, and says so. Planar files (bands stored
+apart), 8- to 64-bit integer and floating-point data, signed-byte data and bottom-up images work
+too. A dated series of GeoTIFFs (an address with date placeholders), a data cube's files and
+AlphaEarth's embeddings are tile layers that follow the time slider or dequantise their values;
+see [Satellite embeddings](web-data.md#satellite-embeddings).
+A GeoTIFF in strips, a rotated image or an unsupported tiled image downloads whole, as does a
+GeoTIFF added with `"whole": true` (for raster tools that need every pixel at full resolution).
+The web app needs the server to allow range requests (CORS with the `Range` header).
 
 On the desktop and the command line, `"bbox"` reads just an area of a cloud-optimised GeoTIFF as
 a raster layer, for files too large to download whole (a national land-cover map, a 1° elevation
@@ -136,10 +177,10 @@ tile), without a STAC catalogue:
 - Only the tiles the window crosses are read, at full resolution. `"cellSize"` reads the coarsest
   overview whose cells are no larger, in the file's units (metres for a longitude/latitude file, a
   degree taken as 111.32 km); one finer than the full image's cells reads the full image, with a
-  notice. Without it the window takes no overview's values. Reading the header still reads up to
-  16 tiles of the coarsest overview at least 256 pixels a side (the full image when none is), for
-  the stretch it is drawn with, as for any GeoTIFF drawn in place. An 8-bit colour file skips it,
-  and so does one whose level has more than 16 tiles: it is drawn with its value type's full range.
+  notice. Without it the window takes no overview's values. Reading the header reads nothing
+  more: a GeoTIFF read in place as a raster layer takes its stretch from the overview it holds,
+  and a tile layer (a dated series, a data cube's file) reads a few tiles of its coarsest
+  overview for its stretch when a tile first needs it.
 - A window holds 64 million values at most, all bands together (256 MB), and 4,096 of the file's
   tiles a band. A window over the first limit is refused, naming the cell size that fits when an
   overview does, or asking for a smaller box; one over the second asks for a coarser level or a
@@ -148,6 +189,13 @@ tile), without a STAC catalogue:
   may take two minutes more): past that the window is given up, saying how many bands were read.
   A window reads 256 bands at most. A window near the limit takes several hundred MB of memory
   while it is read and kept.
+- The Add Data From URL dialog has no box to fill in, so a window is asked for by a command. On
+  the command line and in a script, `layer.addUrl` waits for it and answers what was added. In the
+  desktop app, `ui.addUrl` with `"bbox"` reads it off the frame: the map stays in use, and the
+  layer is added when the read lands. These are read one at a time, with 16 under way at most,
+  and the next starts once the app has taken the last. If another project is opened meanwhile, one
+  still waiting isn't read, and one being read can't be cancelled yet: it runs to its end and
+  isn't added. Each is said in a notice.
 - The file's no-data, colour table (a palette file draws in its colours) and band names come
   with it, and class names given as `CLASS_<value>` items in GDAL's metadata tag, as the MapBiomas
   files on Source Cooperative give theirs. These come from the file's own tags: an `.aux.xml`
@@ -158,7 +206,9 @@ tile), without a STAC catalogue:
   keeps only its first band once the project is reopened, with a notice. Files stored bottom up
   aren't read this way yet. In the web app, `"bbox"` is refused for now: the file is drawn in
   place without it. An address that names another kind of file (`.geojson`, `.fgb`) is refused
-  with `"bbox"` before anything is read; `"cog": true` takes a GeoTIFF by another name.
+  with `"bbox"` before anything is read; `"cog": true` takes a GeoTIFF by another name. A
+  window is a raster layer that the time slider doesn't step through, so `"cube": true` is
+  refused with it.
 
 A GeoParquet or FlatGeobuf file by its address is read in place too, a view at a time, however
 large: the layer is streamed like a large local file, and the view's features are fetched in the
@@ -177,9 +227,10 @@ desktop, while in the web app they need the file downloaded first.
 
 On desktop, `layer.addUrl` waits for downloads, up to a minute; the From URL… dialog (`ui.addUrl`)
 and a plugin's `layer.addUrl` work in the background. In the web app the same dialog handles asynchronous downloads.
-`layer.addUrl` can add PMTiles and COG tile layers directly, but an ordinary download returns
-`{"pending": true, "url": "…"}` and is added later by the app. To open a remote GeoParquet or
-FlatGeobuf whose header hasn't been fetched yet, use the From URL… dialog or a `?data=` link.
+`layer.addUrl` can add PMTiles archives and GeoTIFFs read in place directly, but an ordinary
+download returns `{"pending": true, "url": "…"}` and is added later by the app. To open a remote
+GeoParquet or FlatGeobuf whose header hasn't been fetched yet, use the From URL… dialog or a
+`?data=` link.
 
 ## Map and feature services
 
@@ -506,7 +557,7 @@ were rounded, and Export Raster, which writes the rounded values, says so again.
 | Vector tiles | Mapbox Vector Tiles (`.pbf`, `.mvt`) template, or TileJSON | Add Tile Layer | Drawn in a built-in style that knows the OpenMapTiles, Protomaps and Shortbread schemas. |
 | MapLibre styles | `style.json` | Add Tile Layer | A supported subset of vector and raster sources, sprites, expressions and zoom functions; see [Maps and Basemaps](maps.md#basemaps) for styling limits. |
 | PMTiles | `.pmtiles`: a web address, or a desktop file | Add Tile Layer (or **Tile Archive File…**), Add Data, or drop a local file on desktop | Version 3 archives only: PNG, JPEG or WebP rasters, or MVT vectors; uncompressed, gzip, Brotli or Zstandard. Read a tile at a time by byte ranges (CORS on the web). Browser local-file uploads aren't supported; use an archive's web address. The map moves to the archive's bounds, except a world archive. Vector archives use the built-in basemap style, or a colour per layer when added as an overlay. |
-| MBTiles | `.mbtiles`: a file | Add Data, drop the file, Add Tile Layer's **Tile Archive File…** button, or upload in the web app | Raster (PNG, JPEG, WebP) or vector tiles, as its metadata says, drawn as PMTiles archives are. The desktop reads the file in place, a tile at a time. The web app reads an upload into memory (the plain `tiles` table and the deduplicated layouts of mbutil, TileMill and Planetiler) and keeps it for the session: a project saved there asks for the file again. |
+| MBTiles | `.mbtiles`: a file | Add Data, drop the file, Add Tile Layer's **Tile Archive File…** button, or upload in the web app | Raster (PNG, JPEG, WebP) or vector tiles, as its metadata says, drawn as PMTiles archives are. The desktop reads the file in place, a tile at a time; on Windows the file can't be moved or deleted while a map draws it, until its layer is removed. The web app reads an upload into memory (the plain `tiles` table and the deduplicated layouts of mbutil, TileMill and Planetiler) and keeps it for the session: a project saved there asks for the file again. |
 
 ## Writing
 
@@ -522,7 +573,7 @@ were rounded, and Export Raster, which writes the rounded values, says so again.
 | GeoTIFF / Cloud-optimised GeoTIFF | Data › Export Raster (`share.exportRaster`) | Untiled GeoTIFF by default; `"cog": true` writes 512-pixel tiles, Deflate compression and overviews. Writes the loaded raster's resolution (an overview when that is what was opened), the selected band or its colour bands. The web app's Export Raster downloads an ordinary GeoTIFF. |
 | PNG | Publish › Export Map (`share.exportMap`) | Configurable DPI, with labels, scale bar and tile credits. |
 | PDF | Layouts, reports, presentations and the map view (Print Map), as vectors | |
-| Wavefront OBJ, glTF | Publish › Export To 3D, Share As › Web Scene | Polygons extruded by a field. |
+| Wavefront OBJ, STL, glTF | Publish › Export To 3D, Share As › Web Scene | Polygons extruded by a field. STL is binary and triangles only (no lines). |
 | Web map, OGC API Features, MapLibre style | Publish › Share As | Open-format files that need no server: see [Sharing](sharing.md). |
 | Raster tiles | `imagery.hostedImagery` | A zip of `tiles/z/x/y.png` tiles, `tiles.json` and a viewer page; at most 5,000 tiles and 256 MiB of tile data. |
 
@@ -552,6 +603,32 @@ another system says so; written back in that same system they are exact, and not
 Coordinates beyond ±180.5° longitude or ±90.5° latitude (a CSV of eastings and northings without its
 `"crs"`, a Shapefile without its `.prj`) aren't longitude/latitude: an export says they're out of
 place, and Define Projection, below, places them.
+
+Coordinate systems of other bodies than the Earth (Mars, the Moon and the rest of the IAU's
+`IAU_2015` codes, or any datum whose ellipsoid isn't the Earth's) aren't read as such yet: every
+layer is placed on the Earth.
+
+- **Read, with a notice.** A layer whose coordinates are the body's longitude/latitude, counted
+  east, is read as it is: a geographic `.prj` or WKT, a GeoTIFF's own keys, an IAU code ending in
+  `00` or `02`, or a projection RustGIS unprojects. Adding it says that the map, its scale bar and
+  measurements take it for the Earth.
+- **Refused.** A layer whose coordinates would land in the wrong place as longitude/latitude is
+  refused, and the error says why:
+  - projected metres the reader can't convert: a FlatGeobuf, GeoParquet or GeoJSON whose system
+    is another body's projection, a GeoPackage one known only by its IAU code, or a projection
+    RustGIS doesn't read;
+  - geocentric X/Y/Z (a GeoParquet system);
+  - longitude/latitude in another unit than degrees (a GeoParquet or GeoTIFF one);
+  - longitudes counted west: planetographic systems, and projections of them, unless their axes
+    say they count east. An Esri `.prj` has no axes, so a planetographic one is refused.
+- **Exported.** Exporting such a layer as WGS 84 longitude/latitude says so. Exported in its own
+  system, a vector file (a Shapefile's `.prj`, say) gives its datum only by the ellipsoid's axes,
+  and that is said too. A GeoTIFF read with its own GeoKeys is written back with them and their
+  citation. Projecting such a layer onto another ellipsoid (the Earth's) is refused. A layer known
+  to be another body's only by an IAU code, or by an ellipsoid its reader doesn't keep
+  (GeoParquet), keeps no system, so its export can't tell. Adding it says so instead: an export
+  takes its coordinates for WGS 84 longitude/latitude, and one in a projection projects them as
+  the Earth's.
 
 ## Define Projection
 

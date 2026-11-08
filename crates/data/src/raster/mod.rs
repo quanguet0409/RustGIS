@@ -18,6 +18,7 @@ pub mod gdal;
 pub mod geotiff;
 mod lzw;
 pub mod pam;
+pub mod planetary;
 pub mod wkt;
 pub mod zarr;
 
@@ -517,6 +518,26 @@ impl Band {
     }
 }
 
+/// The longest a raster read in place is waited for natively: its overview as a layer opens, its
+/// tiles as it is exported.
+pub const IN_PLACE_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// An alpha band's opaque value for a pixel type (`UInt16`: 65535): the type's largest, 1 for
+/// floating point (as TIFF keeps it), 255 for bytes and anything else.
+pub fn alpha_max(data_type: &str) -> f32 {
+    match data_type {
+        "Int8" => 127.0,
+        "Int16" => 32767.0,
+        "UInt16" => 65535.0,
+        "Int32" => 2_147_483_647.0,
+        "UInt32" => 4_294_967_295.0,
+        "Int64" => 9.223_372e18,
+        "UInt64" => 1.844_674_4e19,
+        "Float16" | "Float32" | "Float64" => 1.0,
+        _ => 255.0,
+    }
+}
+
 /// How a raster's bands were meant to be shown, from the file.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub enum ColorHint {
@@ -609,6 +630,39 @@ impl Raster {
         color: ColorHint,
         data_type: impl Into<String>,
     ) -> Result<Raster> {
+        Raster::build(name, width, height, bands, transform, crs, nodata, color, data_type, true)
+    }
+
+    /// [`Raster::new`] without statistics (each band's are empty): a part of a larger raster,
+    /// drawn with the whole's (a cloud-optimised GeoTIFF's view, read in place).
+    #[allow(clippy::too_many_arguments)]
+    pub fn unmeasured(
+        name: impl Into<String>,
+        width: u32,
+        height: u32,
+        bands: Vec<Vec<f32>>,
+        transform: GeoTransform,
+        crs: Crs,
+        nodata: Option<f64>,
+        color: ColorHint,
+        data_type: impl Into<String>,
+    ) -> Result<Raster> {
+        Raster::build(name, width, height, bands, transform, crs, nodata, color, data_type, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn build(
+        name: impl Into<String>,
+        width: u32,
+        height: u32,
+        bands: Vec<Vec<f32>>,
+        transform: GeoTransform,
+        crs: Crs,
+        nodata: Option<f64>,
+        color: ColorHint,
+        data_type: impl Into<String>,
+        measure: bool,
+    ) -> Result<Raster> {
         let n = (width as usize).checked_mul(height as usize).ok_or_else(|| DataError::Format("raster too large".into()))?;
         if n == 0 || bands.is_empty() {
             return Err(DataError::Format("the raster has no pixels".into()));
@@ -625,7 +679,12 @@ impl Raster {
         let bands = bands
             .into_iter()
             .enumerate()
-            .map(|(i, data)| Band { name: format!("Band {}", i + 1), stats: BandStats::compute(&data, valid), data, classes: Vec::new() })
+            .map(|(i, data)| Band {
+                name: format!("Band {}", i + 1),
+                stats: if measure { BandStats::compute(&data, valid) } else { BandStats::default() },
+                data,
+                classes: Vec::new(),
+            })
             .collect();
         let mut r = Raster {
             name: name.into(),
@@ -913,7 +972,7 @@ pub fn read_path(path: &Path) -> Result<Raster> {
                 return Err(DataError::Format("the ASCII grid is too large to open".into()));
             }
             let text = std::fs::read_to_string(path)?;
-            ascii::read_with_nodata(&text, &name, sidecar_crs(path), sidecar_nodata)?
+            read_ascii(path, &text, &name, sidecar_nodata)?
         }
         #[cfg(not(target_arch = "wasm32"))]
         _ if gdal::is_gdal_raster_name(&path.to_string_lossy()) => {
@@ -938,7 +997,7 @@ pub fn read_path(path: &Path) -> Result<Raster> {
         // The second read gives all the first did: the first goes before it, so two aren't held.
         drop(r);
         r = if ext == "asc" {
-            ascii::read_with_nodata(&std::fs::read_to_string(path)?, &name, sidecar_crs(path), nd)?
+            read_ascii(path, &std::fs::read_to_string(path)?, &name, nd)?
         } else {
             #[cfg(not(target_arch = "wasm32"))]
             let again = geotiff::read_file_with_nodata(path, &name, nd)?;
@@ -1245,9 +1304,32 @@ pub fn read_bytes(file_name: &str, bytes: &[u8]) -> Result<Raster> {
     }
 }
 
-/// The coordinate system in a `.prj` next to an ASCII grid, when it's one RustGIS understands.
-fn sidecar_crs(path: &Path) -> Option<Crs> {
-    wkt::crs_from_wkt(&read_prj(path)?).ok()
+/// An ASCII grid at `path` (its `text`), in the coordinate system of the `.prj` next to it.
+fn read_ascii(path: &Path, text: &str, name: &str, nodata: Option<f64>) -> Result<Raster> {
+    let (crs, unread) = sidecar_crs(path)?;
+    let mut r = ascii::read_with_nodata(text, name, crs, nodata)?;
+    // A .prj that couldn't be read leaves the grid in longitude/latitude, as a Shapefile's does.
+    r.lost.extend(unread.map(|e| format!("the .prj file: {e}; coordinates are read as longitude/latitude")));
+    Ok(r)
+}
+
+/// The coordinate system in the `.prj` next to an ASCII grid, when RustGIS understands it. Else
+/// why it doesn't, so the grid is read without it and says so. Another body's system RustGIS
+/// doesn't understand is an error instead, because the grid would land in the wrong place as
+/// longitude/latitude.
+fn sidecar_crs(path: &Path) -> Result<(Option<Crs>, Option<String>)> {
+    let Some(prj) = read_prj(path) else {
+        // One that is there but can't be read as text (not UTF-8, too large to be one) is said too.
+        let there = std::fs::metadata(path.with_extension("prj")).is_ok_and(|m| m.is_file());
+        return Ok((None, there.then(|| "it can't be read as text".to_string())));
+    };
+    match wkt::crs_from_wkt(&prj) {
+        Ok(crs) => Ok((Some(crs), None)),
+        Err(e) => match planetary::refused_wkt(&prj, &e) {
+            Some(refused) => Err(DataError::Format(format!("the .prj file: {refused}"))),
+            None => Ok((None, Some(e))),
+        },
+    }
 }
 
 /// The text of the `.prj` next to a file (`None` when there's none, or it's too large to be one).

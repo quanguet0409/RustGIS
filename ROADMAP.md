@@ -101,7 +101,7 @@ And alongside it:
   (`edit.moveSharedVertex`); different vertex densities and linked insertion/deletion remain
   open.
 - Editor tracking fields (created/edited by and at).
-- Attribute table columns: rename, hide and reorder _(open)_.
+- Attribute table columns: rename (hide and reorder are done) _(open)_.
 - Persistent attribute joins and virtual fields. _Coordinate first_ (they change `Feature`).
 - Attribute forms: widgets, constraints and conditional visibility, on top of domains and
   subtypes.
@@ -128,7 +128,7 @@ And alongside it:
 Built in means no runner download, the selection honoured, geodesic distances and attributes
 kept. Before adding a tool, check whether the GeoLibre suite already has it (`gp.tools`); a
 built-in version must justify itself on one of those.
-- STL export; copy a layout to the clipboard.
+- Copy a layout to the clipboard.
 - UTM and MGRS grids and coordinate readouts.
 - H3 grids built in, next to the A5 grids (the GeoLibre suite has H3 tools only when its runner
   is installed).

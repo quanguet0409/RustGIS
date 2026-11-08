@@ -1,9 +1,13 @@
 //! L2: geoprocessing tools.
 //!
 //! Each tool is a [`ToolSpec`]: an id, a toolbox, parameters for the Tools pane, and a
-//! pure `run` function over datasets. Inputs refer to layers by name through [`Inputs`]. Work is
-//! done in Web Mercator metres, except buffers, which are geodesic: drawn in a projection centred
-//! on each feature (see [`geodesic`]) so a 100 km buffer is 100 km on the ground.
+//! pure `run` function over datasets. Inputs refer to layers by name through [`Inputs`].
+//! The geometry tools and topology checks work in the analysis plane
+//! ([`rustgis_geom::lonlat_to_plane`]: Web Mercator meters within ±85.05°, continued beyond to
+//! the poles), radius searches in Web Mercator meters (on the ground when the center or the
+//! feature's box reaches beyond 85.05°, see [`network::within`]), and buffers are geodesic: drawn
+//! in a projection centered on each feature (see [`geodesic`]) so a 100 km buffer is 100 km on the
+//! ground.
 //!
 //! Tools from external suites (the GeoLibre/Whitebox tools in `rustgis-geolibre`, and plugins
 //! in `rustgis-plugins`) join the built-in ones through [`register_external`]: they're listed by [`tools`], found by
@@ -227,6 +231,7 @@ struct Source {
     provider: ExternalProvider,
     runner: ExternalRunner,
     tools: Option<&'static [ToolSpec]>,
+    generation: u64,
 }
 
 static SOURCES: std::sync::RwLock<Vec<Source>> = std::sync::RwLock::new(Vec::new());
@@ -238,43 +243,42 @@ pub fn register_external(key: &'static str, provider: ExternalProvider, runner: 
     if let Ok(mut v) = SOURCES.write()
         && !v.iter().any(|s| s.key == key)
     {
-        v.push(Source { key, provider, runner, tools: None });
+        v.push(Source { key, provider, runner, tools: None, generation: 0 });
     }
 }
 
 /// The tools of the suite registered as `key` (empty when there is none).
 pub fn external_tools_of(key: &str) -> &'static [ToolSpec] {
-    let provider = match SOURCES.read() {
+    if let Ok(v) = SOURCES.read()
+        && let Some(tools) = v.iter().find(|s| s.key == key).and_then(|s| s.tools)
+    {
+        return tools;
+    }
+    // Discovery is an explicit loading API. A reload while the provider runs must not
+    // publish the superseded result as the current schema.
+    static LOADING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let Ok(_loading) = LOADING.lock() else { return &[] };
+    let (provider, generation) = match SOURCES.read() {
         Ok(v) => match v.iter().find(|s| s.key == key) {
             Some(Source { tools: Some(t), .. }) => return t,
-            Some(s) => s.provider,
+            Some(s) => (s.provider, s.generation),
             None => return &[],
         },
         Err(_) => return &[],
     };
-    // One load at a time: a second caller waits for the first instead of loading again. The
-    // provider runs without the sources' lock held, so a slow one never blocks the others.
-    static LOADING: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _loading = LOADING.lock();
-    if let Ok(v) = SOURCES.read()
-        && let Some(Source { tools: Some(t), .. }) = v.iter().find(|s| s.key == key)
-    {
-        return t;
-    }
-    let tools: &'static [ToolSpec] = Box::leak(
-        std::panic::catch_unwind(provider)
-            .unwrap_or_else(|_| {
-                log::error!("the external tools '{key}' failed to load");
-                Vec::new()
-            })
-            .into_boxed_slice(),
-    );
+    let tools = std::panic::catch_unwind(provider).unwrap_or_else(|_| {
+        log::error!("the external tools '{key}' failed to load");
+        Vec::new()
+    });
     match SOURCES.write() {
-        Ok(mut v) => match v.iter_mut().find(|s| s.key == key) {
-            Some(s) => s.tools.get_or_insert(tools),
-            None => tools,
+        Ok(mut v) => match v.iter_mut().find(|s| s.key == key && s.generation == generation) {
+            Some(s) => s.tools.get_or_insert_with(|| Box::leak(tools.into_boxed_slice())),
+            None => {
+                log::info!("{} external tool schema(s) from '{key}' discarded after its registration changed during loading", tools.len());
+                &[]
+            }
         },
-        Err(_) => tools,
+        Err(_) => &[],
     }
 }
 
@@ -289,6 +293,7 @@ pub fn reload_external() {
     if let Ok(mut v) = SOURCES.write() {
         for s in v.iter_mut() {
             s.tools = None;
+            s.generation = s.generation.saturating_add(1);
         }
     }
 }
@@ -300,6 +305,7 @@ pub fn reload_external_of(key: &str) {
         && let Some(s) = v.iter_mut().find(|s| s.key == key)
     {
         s.tools = None;
+        s.generation = s.generation.saturating_add(1);
     }
 }
 
@@ -337,6 +343,95 @@ pub fn tool(id: &str) -> Option<&'static ToolSpec> {
     tools().find(by_id).or_else(|| TOOLS.iter().find(by_name)).or_else(|| external_tools().into_iter().find(by_name))
 }
 
+/// A tool specification and its runner resolved together, before a later stage starts.
+/// Reloading a suite does not replace either part of this value. Plugin callers must also
+/// pin the plugin load: the plugins suite's runner alone does not identify that load.
+#[derive(Clone, Copy)]
+pub struct ResolvedTool {
+    spec: &'static ToolSpec,
+    source: Option<&'static str>,
+    runner: Option<ExternalRunner>,
+    generation: u64,
+}
+
+impl ResolvedTool {
+    /// An external spec belongs to the exact currently published load, without name lookup.
+    pub fn is_current(&self) -> bool {
+        self.source.is_none_or(|source| {
+            SOURCES.read().is_ok_and(|v| {
+                v.iter().any(|s| {
+                    s.key == source
+                        && s.generation == self.generation
+                        && s.tools.is_some_and(|tools| tools.iter().any(|spec| std::ptr::eq(spec, self.spec)))
+                })
+            })
+        })
+    }
+    /// The immutable schema captured when this tool was resolved.
+    pub fn spec(&self) -> &'static ToolSpec {
+        self.spec
+    }
+
+    /// The captured external suite, or `None` for a built-in tool.
+    pub fn source(&self) -> Option<&'static str> {
+        self.source
+    }
+
+    /// Resolves defaults using this tool's original schema and suite classification.
+    pub fn resolve_params(&self, params: &Value) -> Result<Value, String> {
+        params_for(self.spec, params, self.runner.is_none())
+    }
+}
+
+/// Resolves ids before names, with built-in names winning over external names, as [`tool`]
+/// does. The owning suite and runner come from the same lookup as its specification.
+pub fn resolve(name: &str) -> Option<ResolvedTool> {
+    if TOOLS.iter().any(|t| t.id.eq_ignore_ascii_case(name)) {
+        return resolve_published(name);
+    }
+    let _ = external_tools();
+    resolve_published(name)
+}
+
+/// Published schemas only: this accessor never invokes a provider or performs discovery.
+pub fn published_external_tools_of(key: &str) -> &'static [ToolSpec] {
+    SOURCES.read().ok().and_then(|v| v.iter().find(|s| s.key == key).and_then(|s| s.tools)).unwrap_or(&[])
+}
+
+/// Lists builtins and currently published external schemas without initializing any source.
+pub fn published_tools() -> impl Iterator<Item = &'static ToolSpec> {
+    let external: Vec<_> = SOURCES.read().map(|v| v.iter().flat_map(|s| s.tools.unwrap_or(&[]).iter()).collect()).unwrap_or_default();
+    TOOLS.iter().chain(external)
+}
+
+/// Resolves only published schemas and captures the same publication's runner and generation.
+/// IDs precede names; builtin display names precede external display names. Missing publication
+/// remains missing until trusted native startup or an explicitly authorized loading action.
+pub fn resolve_published(name: &str) -> Option<ResolvedTool> {
+    let builtin = |spec| ResolvedTool { spec, source: None, runner: None, generation: 0 };
+    if let Some(spec) = TOOLS.iter().find(|t| t.id.eq_ignore_ascii_case(name)) {
+        return Some(builtin(spec));
+    }
+    let v = SOURCES.read().ok()?;
+    let external: Vec<_> = v
+        .iter()
+        .flat_map(|s| {
+            s.tools.unwrap_or(&[]).iter().map(move |spec| ResolvedTool {
+                spec,
+                source: Some(s.key),
+                runner: Some(s.runner),
+                generation: s.generation,
+            })
+        })
+        .collect();
+    external
+        .iter()
+        .find(|r| r.spec.id.eq_ignore_ascii_case(name))
+        .copied()
+        .or_else(|| TOOLS.iter().find(|t| t.name.eq_ignore_ascii_case(name)).map(builtin))
+        .or_else(|| external.into_iter().find(|r| r.spec.name.eq_ignore_ascii_case(name)))
+}
+
 /// The runner for external tools; never called (external specs carry the runner's id).
 pub fn external_placeholder(_: &dyn Inputs, _: &Value) -> Result<ToolResult, String> {
     Err("this tool runs through the external suite".into())
@@ -346,9 +441,12 @@ pub fn external_placeholder(_: &dyn Inputs, _: &Value) -> Result<ToolResult, Str
 /// [`run`] does this first; a host that runs an external tool another way (the browser's
 /// asynchronous runner) does it too, so both check parameters the same way.
 pub fn resolve_params(spec: &ToolSpec, params: &Value) -> Result<Value, String> {
+    params_for(spec, params, source_of(spec).is_none())
+}
+
+/// Applies the captured schema without looking its suite up again after a reload.
+fn params_for(spec: &ToolSpec, params: &Value, built_in: bool) -> Result<Value, String> {
     let mut p = params.as_object().cloned().unwrap_or_default();
-    // Not an external suite's tool (a copy of a built-in spec counts as built-in).
-    let built_in = source_of(spec).is_none();
     if built_in {
         tools::normalize_params(spec, &mut p);
     }
@@ -468,11 +566,73 @@ pub fn run(id: &str, inputs: &dyn Inputs, params: &Value) -> Result<ToolResult, 
     let spec = tool(id).ok_or_else(|| format!("no tool '{id}'"))?;
     let p = resolve_params(spec, params)?;
     // A bug in a tool must not take the app down.
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match source_of(spec) {
-        Some((_, runner)) => runner(spec, inputs, &p),
-        None => (spec.run)(inputs, &p),
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        validate_pole_inputs(spec, inputs, &p)?;
+        match source_of(spec) {
+            Some((_, runner)) => runner(spec, inputs, &p),
+            None => (spec.run)(inputs, &p),
+        }
     }))
     .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", spec.name)))
+}
+
+/// Validates the rows a pole-aware tool reads, on either execution path.
+fn validate_pole_inputs(spec: &ToolSpec, inputs: &dyn Inputs, p: &Value) -> Result<(), String> {
+    if matches!(
+        spec.id,
+        "clip"
+            | "erase"
+            | "intersect"
+            | "identity"
+            | "union"
+            | "symmetricalDifference"
+            | "update"
+            | "split"
+            | "countPoints"
+            | "spatialJoin"
+            | "selectByLocation"
+    ) {
+        for param in spec
+            .params
+            .iter()
+            .filter(|p| matches!(p.kind, ParamKind::Layer | ParamKind::PolygonLayer | ParamKind::PointLayer | ParamKind::VectorLayer))
+        {
+            if let Some(name) = p.get(param.name).and_then(Value::as_str)
+                && let Some(ds) = inputs.dataset(name)
+            {
+                let selected = inputs.selection(name);
+                let reads_all = matches!((spec.id, param.name), ("selectByLocation", "input") | ("countPoints", "polygons"));
+                if selected.is_empty() || reads_all {
+                    validate_latitudes(ds, 0..ds.features.len())?;
+                } else {
+                    validate_latitudes(ds, selected.iter().copied())?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Refuses latitudes outside the Earth, including infinities, instead of clamping them to a pole.
+pub fn validate_latitudes(ds: &rustgis_data::Dataset, rows: impl IntoIterator<Item = usize>) -> Result<(), String> {
+    let invalid = rows
+        .into_iter()
+        .filter(|&row| {
+            let mut invalid = false;
+            if let Some(g) = ds.features.get(row).and_then(|f| f.geometry.as_ref()) {
+                g.for_each_coord(|c| invalid |= c.y.abs() > 90.0);
+            }
+            invalid
+        })
+        .count();
+    if invalid > 0 {
+        Err(format!(
+            "'{name}' has {invalid} feature(s) with a latitude past ±90°; repair their coordinates before analysis",
+            name = ds.name
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 /// [`run`] under `control`: setting its flag stops the tool at its next check, and its count
@@ -484,20 +644,44 @@ pub fn run_with(id: &str, inputs: &dyn Inputs, params: &Value, control: &std::sy
     run_under(tool(id).map_or(id, |t| t.name), control, || run(id, inputs, params))
 }
 
+/// Runs the captured specification and suite runner under `control`, without resolving its
+/// name again. Plugin execution instead needs the plugin load's own pinned preparation.
+pub fn run_resolved(
+    tool: &ResolvedTool,
+    inputs: &dyn Inputs,
+    params: &Value,
+    control: &std::sync::Arc<control::Control>,
+) -> Result<ToolResult, String> {
+    run_under(tool.spec.name, control, || {
+        let params = tool.resolve_params(params)?;
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            validate_pole_inputs(tool.spec, inputs, &params)?;
+            match tool.runner {
+                Some(runner) => runner(tool.spec, inputs, &params),
+                None => (tool.spec.run)(inputs, &params),
+            }
+        }))
+        .unwrap_or_else(|_| Err(format!("{} failed unexpectedly", tool.spec.name)))
+    })
+}
+
 /// `work` on this thread under `control`, as [`run_with`] runs a tool, for work that isn't one (an
 /// engine command's raster): setting `control`'s flag from another thread stops it at its next
 /// check, its count follows the work's progress, and a cancelled run's error says how far `name`
 /// came.
 pub fn run_under<T>(name: &str, control: &std::sync::Arc<control::Control>, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let still = rustgis_data::source::remote::current_still();
+    rustgis_data::source::remote::check_still(&still)?;
     if control.is_cancelled() {
         return Err(format!("{name} was cancelled before it started"));
     }
     let _current = control::install(Some(control.clone()));
     // A file the work writes or reads counts and stops with it too.
-    let _data = rustgis_data::progress::install(Some(control.clone()));
+    let _data = control::install_progress(Some(control.clone()));
     // No count until the work starts one: a control used before doesn't show that run's.
     control::begin(0);
     let res = work();
+    rustgis_data::source::remote::check_still(&still)?;
     if !control.is_cancelled() {
         // Finished: its last step is all done, however it counted. A failed one stays where it
         // stopped.

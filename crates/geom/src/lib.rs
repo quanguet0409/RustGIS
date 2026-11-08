@@ -1,15 +1,19 @@
-//! L0: coordinates, extents, the Web Mercator projection, geodesic measurement and map scale.
+//! L0: coordinates, extents, the Web Mercator projection, geodesic measurement, map scale, and
+//! UTM and MGRS coordinates ([`utm`]).
 //!
 //! Everything here is plain math with no I/O. Longitude/latitude are WGS 84 degrees; projected
-//! coordinates are Web Mercator metres (EPSG:3857).
+//! coordinates are Web Mercator meters (EPSG:3857), which [`lonlat_to_plane`] continues beyond
+//! 85.05° to the poles for analysis.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod body;
 pub mod sinusoidal;
 pub mod triangulate;
+pub mod utm;
 
 pub use body::{BODIES, Body};
 pub use sinusoidal::Sinusoidal;
+pub use utm::{GridError, Mgrs, Utm, format_mgrs, format_utm, parse_mgrs, parse_utm, to_mgrs, to_utm};
 
 use std::sync::LazyLock;
 
@@ -22,10 +26,17 @@ pub const EARTH_RADIUS_M: f64 = 6_371_008.8;
 /// equator (metres). Every path on the ellipsoid is at least as long as on a sphere of this radius
 /// through the same longitudes and latitudes, so a reach worked out on that sphere is never short.
 pub const WGS84_MIN_RADIUS_M: f64 = 6_335_439.327_293;
+/// The WGS 84 ellipsoid's radius of curvature at the poles, a²/b = a/(1 − f) (meters): near a pole,
+/// distances along and across meridians are about this radius times the angle.
+pub const WGS84_POLAR_RADIUS_M: f64 = body::EARTH.a / (1.0 - 1.0 / body::EARTH.inv_f);
 /// Web Mercator sphere radius (metres).
 pub const MERCATOR_R: f64 = 6_378_137.0;
 /// Latitude limit of Web Mercator.
 pub const MAX_LAT: f64 = 85.051_128_78;
+/// How near ±90° (degrees) a latitude counts as the pole: about a centimeter, more than geometry
+/// operations' rounding moves a pole vertex (around 1e-8°). For the polar edits and the features
+/// meeting at a pole that build on this (#1033); here only the tests use it.
+pub const POLE_TOLERANCE: f64 = 1e-7;
 /// Screen pixel size assumed when converting resolution to a map scale (0.28 mm, OGC).
 pub const PIXEL_M: f64 = 0.000_28;
 
@@ -173,6 +184,49 @@ pub fn merc_to_lonlat(c: Coord) -> Coord {
     Coord::new(lon, lat)
 }
 
+/// Web Mercator's northing at [`MAX_LAT`] north and south, each as [`lonlat_to_merc`] rounds it
+/// (the two differ by a rounding), and how fast it grows there (meters a radian of latitude,
+/// R·sec [`MAX_LAT`]): where [`lonlat_to_plane`] carries it on to the poles.
+static MERC_EDGE: LazyLock<(f64, f64, f64)> = LazyLock::new(|| {
+    let edge = |lat: f64| lonlat_to_merc(Coord::new(0.0, lat)).y;
+    (edge(MAX_LAT), edge(-MAX_LAT), MERCATOR_R / MAX_LAT.to_radians().cos())
+});
+
+/// Longitude/latitude (degrees) → the plane the analysis tools work in (meters): Web Mercator
+/// within ±[`MAX_LAT`], exactly as [`lonlat_to_merc`] gives it, and beyond, where Web Mercator
+/// stops, continued straight in latitude at the rate it reaches there, so the two meet smoothly and
+/// the poles lie at ±26,424 km. Nothing within ±90° is clamped (a latitude past one is taken as
+/// the pole), so a polar feature keeps its shape through an overlay. Beyond 85.05°, where the plane
+/// is linear in latitude, an edge straight in the plane is straight in longitude and latitude too
+/// (Web Mercator's view still draws it clamped to its edge).
+pub fn lonlat_to_plane(c: Coord) -> Coord {
+    let lat = c.y.clamp(-90.0, 90.0);
+    // False for NaN, which then stays NaN below.
+    if lat.abs() <= MAX_LAT {
+        return lonlat_to_merc(c);
+    }
+    let (north, south, rate) = *MERC_EDGE;
+    let beyond = (lat.abs() - MAX_LAT).to_radians() * rate;
+    Coord::new(MERCATOR_R * c.x.to_radians(), if lat > 0.0 { north + beyond } else { south - beyond })
+}
+
+/// The analysis plane's meters → longitude/latitude (degrees), undoing [`lonlat_to_plane`]:
+/// [`merc_to_lonlat`] within Web Mercator's square, and beyond it back along the continuation, to
+/// ±90° at most.
+pub fn plane_to_lonlat(p: Coord) -> Coord {
+    let (north, south, rate) = *MERC_EDGE;
+    let beyond = if p.y > north {
+        p.y - north
+    } else if p.y < south {
+        south - p.y
+    } else {
+        // Within the square, or NaN, which merc_to_lonlat keeps NaN.
+        return merc_to_lonlat(p);
+    };
+    let lat = (MAX_LAT + (beyond / rate).to_degrees()).min(90.0);
+    Coord::new((p.x / MERCATOR_R).to_degrees(), lat.copysign(p.y))
+}
+
 /// Projects a lon/lat extent to Web Mercator, preserving unwrapped longitudes for spans below
 /// 360°. A span of a full turn or more maps to the standard world bounds.
 pub fn extent_to_merc(e: &Extent) -> Extent {
@@ -281,6 +335,55 @@ pub fn spherical_centre(pts: &[Coord]) -> Option<Coord> {
         s = [s[0] + v[0], s[1] + v[1], s[2] + v[2]];
     }
     from_vector(s)
+}
+
+/// The center on the sphere of points taken one at a time, each with a weight (such as stretches
+/// of lines by their lengths): their weighted mean direction from the Earth's center.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SphericalMean {
+    sum: [f64; 3],
+    weight: f64,
+    /// How many times the totals were scaled down by 2⁵¹² to keep them finite.
+    shrunk: i32,
+}
+
+impl SphericalMean {
+    /// Takes in a point; a non-finite one is left out.
+    pub fn add(&mut self, c: Coord) {
+        self.add_weighted(c, 1.0);
+    }
+
+    /// Takes in a point counting `weight` times (as a stretch of a line does, by its length); a
+    /// non-finite point, or a weight that isn't a positive normal number (zero, negative,
+    /// subnormal, missing or infinite), is left out: a subnormal one rounds its direction away.
+    pub fn add_weighted(&mut self, c: Coord, weight: f64) {
+        if c.is_finite() && weight.is_normal() && weight > 0.0 {
+            // Totals that would overflow are scaled down by a power of two, as is every weight
+            // after, which leaves the mean as it was (a weight tiny beside them drops to nothing,
+            // as it would anyway).
+            let shrink = 0.5f64.powi(512);
+            let mut weight = weight * 0.5f64.powi(self.shrunk.saturating_mul(512));
+            if self.weight + weight > 1e300 {
+                self.sum = self.sum.map(|s| s * shrink);
+                self.weight *= shrink;
+                self.shrunk = self.shrunk.saturating_add(1);
+                weight *= shrink;
+            }
+            let (s, v) = (self.sum, unit_vector(c));
+            self.sum = [s[0] + v[0] * weight, s[1] + v[1] * weight, s[2] + v[2] * weight];
+            self.weight += weight;
+        }
+    }
+
+    /// The center of the points so far, or `None` when there are none or they balance out (such as
+    /// two antipodes) to within rounding of their total weight.
+    pub fn center(&self) -> Option<Coord> {
+        if self.weight <= 0.0 {
+            return None;
+        }
+        // Their mean direction, as a vector no longer than 1 (the threshold is then relative).
+        from_vector(self.sum.map(|s| s / self.weight))
+    }
 }
 
 /// The point `dist_m` metres from `c` along the geodesic leaving it at `azimuth_deg` (clockwise
@@ -470,6 +573,17 @@ impl Aeqd {
         let (lat, lon): (f64, f64) = WGS84.direct(self.lat0, self.lon0, p.x.atan2(p.y).to_degrees(), p.x.hypot(p.y));
         Coord::new(self.lon0 + wrap_lon(lon - self.lon0), lat)
     }
+
+    /// [`Aeqd::inverse`], with the azimuth (degrees clockwise from north) the geodesic from the
+    /// center arrives there with: a direction carried along it turns as much as that differs from
+    /// the azimuth it left with, `p.x.atan2(p.y)`.
+    pub fn inverse_heading(&self, p: Coord) -> (Coord, f64) {
+        if !(p.x.is_finite() && p.y.is_finite()) {
+            return (Coord::new(f64::NAN, f64::NAN), f64::NAN);
+        }
+        let (lat, lon, azi2): (f64, f64, f64) = WGS84.direct(self.lat0, self.lon0, p.x.atan2(p.y).to_degrees(), p.x.hypot(p.y));
+        (Coord::new(self.lon0 + wrap_lon(lon - self.lon0), lat), azi2)
+    }
 }
 
 /// Area of a lon/lat ring on the sphere (square metres, always positive).
@@ -597,6 +711,71 @@ pub fn format_dms(c: Coord) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_weighted_point_counts_as_that_many() {
+        // Weight 2 is the point taken twice; a weight of 0, below 0 or missing, and a point
+        // missing a coordinate, are left out.
+        let (a, b) = (Coord::new(0.0, 0.0), Coord::new(90.0, 0.0));
+        let (mut twice, mut weighted) = (SphericalMean::default(), SphericalMean::default());
+        [a, a, b].into_iter().for_each(|c| twice.add(c));
+        weighted.add_weighted(a, 2.0);
+        weighted.add(b);
+        for (c, w) in [(b, 0.0), (b, -1.0), (b, f64::NAN), (Coord::new(f64::NAN, 0.0), 1.0)] {
+            weighted.add_weighted(c, w);
+        }
+        let (t, w) = (twice.center().unwrap(), weighted.center().unwrap());
+        assert!((t.x - w.x).abs() < 1e-12 && (t.y - w.y).abs() < 1e-12, "{t:?} {w:?}");
+        // Antipodes weighing a million each balance out, to within their rounding.
+        let mut balanced = SphericalMean::default();
+        balanced.add_weighted(a, 1e6);
+        balanced.add_weighted(Coord::new(180.0, 0.0), 1e6);
+        assert_eq!(balanced.center(), None);
+    }
+
+    #[test]
+    fn any_weight_gives_the_mean() {
+        // A tiny weight alone is still a center, and the largest weights don't overflow the
+        // totals: a and b at the largest weight each meet halfway, and a third point weighing
+        // the same pulls the center towards it, as at any weight.
+        let (a, b) = (Coord::new(0.0, 0.0), Coord::new(90.0, 0.0));
+        let mut tiny = SphericalMean::default();
+        tiny.add_weighted(b, 1e-13);
+        assert_eq!(tiny.center(), Some(b));
+        let (mut huge, mut unit) = (SphericalMean::default(), SphericalMean::default());
+        for c in [a, b, a] {
+            huge.add_weighted(c, f64::MAX);
+            unit.add_weighted(c, 1.0);
+        }
+        let mut half = SphericalMean::default();
+        half.add_weighted(a, f64::MAX);
+        half.add_weighted(b, f64::MAX);
+        let mid = half.center().unwrap();
+        assert!((mid.x - 45.0).abs() < 1e-9 && mid.y.abs() < 1e-9, "{mid:?}");
+        // Totals scaled down once they hold a point: the second 1e300 passes the limit.
+        let mut grown = SphericalMean::default();
+        grown.add_weighted(a, 1e300);
+        grown.add_weighted(b, 1e300);
+        let mid = grown.center().unwrap();
+        assert!((mid.x - 45.0).abs() < 1e-9 && mid.y.abs() < 1e-9, "{mid:?}");
+        // A subnormal weight is left out, as a zero one is: alone, no center.
+        let mut sub = SphericalMean::default();
+        sub.add_weighted(b, 5e-324);
+        assert_eq!(sub.center(), None);
+        let (h, u) = (huge.center().unwrap(), unit.center().unwrap());
+        assert!((h.x - u.x).abs() < 1e-9 && (h.y - u.y).abs() < 1e-9, "{h:?} {u:?}");
+    }
+
+    #[test]
+    fn a_geodesic_arrives_turned_as_far_as_it_has_gone_around_the_pole() {
+        // From 88°N, east 300 km: near a pole the geodesic turns away from it by about as much
+        // longitude as it covers (53° here), arriving heading south of east; a step of a
+        // trillionth of a meter doesn't turn at all.
+        let (at, heading) = Aeqd::new(Coord::new(0.0, 88.0)).inverse_heading(Coord::new(300_000.0, 0.0));
+        assert!(((heading - 90.0) - at.x).abs() < 1.0 && at.x > 45.0, "{at:?} {heading}");
+        let (_, heading) = Aeqd::new(Coord::new(0.0, 88.0)).inverse_heading(Coord::new(1e-12, 0.0));
+        assert!((heading - 90.0).abs() < 1e-9, "{heading}");
+    }
 
     #[test]
     fn mercator_roundtrip() {
@@ -871,6 +1050,43 @@ mod tests {
         assert!((geodesic_interpolate(Coord::new(179.0, 0.0), Coord::new(-179.0, 0.0), 0.5).x - 180.0).abs() < 1e-9);
         assert_eq!(spherical_centre(&[Coord::new(179.0, 0.0), Coord::new(-179.0, 0.0)]).map(|c| c.x.abs().round()), Some(180.0));
         assert!(spherical_centre(&[]).is_none());
+    }
+
+    #[test]
+    fn the_analysis_plane_is_web_mercator_within_its_square_and_reaches_the_poles() {
+        // Within ±MAX_LAT, to the bit what the tools used before, both ways, past ±180° too.
+        for i in -40..=40 {
+            let lat = MAX_LAT * f64::from(i) / 40.0;
+            for lon in [-540.0, -180.0, -0.5, 0.0, 33.3, 179.999, 180.0, 541.25] {
+                let c = Coord::new(lon, lat);
+                let (m, p) = (lonlat_to_merc(c), lonlat_to_plane(c));
+                assert!(m.x.to_bits() == p.x.to_bits() && m.y.to_bits() == p.y.to_bits(), "{c:?}");
+                let (a, b) = (merc_to_lonlat(m), plane_to_lonlat(m));
+                assert!(a.x.to_bits() == b.x.to_bits() && a.y.to_bits() == b.y.to_bits(), "{c:?}");
+            }
+        }
+        // Beyond, nothing is clamped: latitude climbs on to the poles, about 26,424 km out, meeting
+        // Web Mercator at its edge with the same slope (R·sec 85.05° a radian), and comes back.
+        let y = |lat: f64| lonlat_to_plane(Coord::new(10.0, lat)).y;
+        assert!((y(90.0) - 26_423_582.9).abs() < 1.0 && (y(-90.0) + y(90.0)).abs() < 1e-6, "{}", y(90.0));
+        let h = 1e-6;
+        let (below, above) = ((y(MAX_LAT) - y(MAX_LAT - h)) / h, (y(MAX_LAT + h) - y(MAX_LAT)) / h);
+        assert!((above / below - 1.0).abs() < 1e-5, "{below} {above}");
+        let mut last = y(MAX_LAT);
+        for i in 1..=100 {
+            let lat = MAX_LAT + (90.0 - MAX_LAT) * f64::from(i) / 100.0;
+            assert!(y(lat) > last, "{lat}");
+            last = y(lat);
+            for sign in [1.0, -1.0] {
+                let back = plane_to_lonlat(lonlat_to_plane(Coord::new(-170.25, sign * lat)));
+                assert!((back.y - sign * lat).abs() < 1e-9 && (back.x + 170.25).abs() < 1e-12, "{lat}: {back:?}");
+            }
+        }
+        // Junk stays junk or lands on a pole, never panics or goes past one.
+        assert!(lonlat_to_plane(Coord::new(0.0, f64::NAN)).y.is_nan() && plane_to_lonlat(Coord::new(0.0, f64::NAN)).y.is_nan());
+        assert_eq!(lonlat_to_plane(Coord::new(0.0, f64::INFINITY)).y, y(90.0));
+        assert_eq!(lonlat_to_plane(Coord::new(0.0, -1e300)).y, y(-90.0));
+        assert_eq!((plane_to_lonlat(Coord::new(0.0, 1e300)).y, plane_to_lonlat(Coord::new(0.0, f64::NEG_INFINITY)).y), (90.0, -90.0));
     }
 
     #[test]

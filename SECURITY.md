@@ -19,6 +19,35 @@ RustGIS is released often and fixes go into the next release; older releases don
 patches. Check that the problem still happens with the
 [latest release](https://github.com/opengeos/RustGIS/releases/latest) or `main`.
 
+## Sharing projects and generated items
+
+Saving removes credentials from supported address fields and recognized executable parameters,
+and reports counted removals. Feature data, user notes, foreign-language notebook code and opaque
+plugin content can still contain sensitive information. Data-valued command parameters, such as
+imported feature text and expressions, are preserved too. Supplied service documents are kept
+opaque, with an unchecked-content notice when recognizable credential material is found.
+An unchecked-content notice means that content was preserved, not verified safe. Review it
+before sharing; saving is not a general secret scanner.
+
+For an older file or log that exposed a key, revoke or rotate it with its service. Saving again
+cleans only recognized fields and cannot recall shared copies. For a Jupyter notebook, also clear
+saved widget state and save again; printed cell output and user data require your own review.
+
+## Active-login output redaction
+
+While a service login is active, generated output masks its known secrets throughout the
+process. A very short password can therefore also mask ordinary words, names or addresses,
+including output from another session. This changes displayed output, not the stored data,
+requests or permission checks. RustGIS does not retain revoked secrets just to recognize them
+in later output; review that output before sharing it.
+
+## Embedding-page command boundary
+
+The execution policy covers engine commands admitted through named assistant, MCP, plugin and
+imported-item scopes. The authority of `ui.*` RUN messages from embedding pages remains a
+separate, unresolved boundary; engine approval checks do not establish authorization for those
+UI messages.
+
 ## What counts as a security problem
 
 RustGIS makes promises about what untrusted plugins, files, agents and web pages can do. A way
